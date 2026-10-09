@@ -1,0 +1,33 @@
+# Python and packaging
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Development tools
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.vscode/
+ruff.out
+ty.out
+.coverage*
+coverage.xml
+htmlcov/
+
+# Local files
+.DS_Store
+*Zone.Identifier*
+*~
+*.bak
+output/
+
+# Calculations and literature
+*.xyz
+*.traj
+*.npz
+*.pdf

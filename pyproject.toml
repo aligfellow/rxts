@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rxts"
+version = "0.1.0"
+description = "VeloxChem-derived reaction mapping and force-field TS guesses"
+authors = [{name = "Alister S. Goodfellow"}]
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.24",
+    "rdkit>=2026.3.6",
+    "networkx>=3.0",
+    "ase>=3.22",
+    "tblite>=0.7.0",
+    "pillow",
+    "threadpoolctl>=3.0",
+    "rxembed @ git+https://github.com/aligfellow/rxembed",
+    "xyzgraph>=1.6.16",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+ff = ["gfnff @ git+https://github.com/pprcht/gfnff"]
+viz = ["plotprofile>=2.0.0", "xyzrender>=0.3"]
+
+[project.scripts]
+rxts = "rxts.cli:main"
+
+[project.urls]
+homepage = "https://github.com/aligfellow/rxts"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=3.5.0",
+    "pytest>=8.3.5",
+    "pytest-cov>=5.0.0",
+    "ruff==0.15.22",
+    "ty>=0.0.14",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "B",      # bugbear
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming conventions
+    "W",      # pycodestyle warnings
+    "C4",     # comprehensions
+    "PL",     # pylint
+    "PT",     # flake8-pytest-style
+    "PIE",    # misc lints
+    "PYI",    # flake8-pyi
+    "TID",    # tidy imports
+    "TCH",    # type-checking imports
+    "RUF",    # Ruff-specific rules
+    "RSE",    # flake8-raise
+    "ICN001", # unconventional-import-alias
+]
+ignore = [
+    "PLR0911", # Too many returns
+    "PLR0912", # Too many branches
+    "PLR0913", # Too many arguments to function call
+    "PLR0914", # Too many locals
+    "PLR0915", # Too many statements
+    "PLR1702", # Too many nested-blocks
+    "PLC0415", # Imports at the point of use
+    "PLR2004", # Literal numerical values are valid in algorithms and assertions
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ty.src]
+include = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
