@@ -54,7 +54,7 @@ The attribute is `n_conformers`. Sampling is on by default:
 | Setting | Default | Controls |
 |---|---|---|
 | `n_lambda` | 21 | FF path frames |
-| `n_conformers` | 4 | Initial torsion-trial budget; also the MD trial budget when MD is enabled |
+| `n_conformers` | 4 | Initial torsion-trial budget, kept by the lowest peak over a short path preview; also the MD trial budget when MD is enabled |
 | `n_embed` | 4 | rxembed proposals per window near the peak |
 | `md_steps` | 0 | Langevin steps per MD proposal; zero disables MD |
 
