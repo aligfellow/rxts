@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -296,12 +297,18 @@ def test_metal_guidance_changes_sampling_only():
     np.testing.assert_array_equal(disabled[1], unguided[1])
 
 
-def test_native_haptic_angle_mapping():
+def test_native_haptic_angle_mapping(monkeypatch):
     class Haptic:
         atoms = (1, 2)
 
     state = type("Centre", (), {"atom": 0, "vertices": (Haptic(), 3, None)})()
-    isomer = type("Isomer", (), {"centres": (state,)})()
+    species = object()
+
+    def identity(mol):
+        assert mol is species
+        return SimpleNamespace(centres=(state,))
+
+    monkeypatch.setattr(evb, "rxembed", SimpleNamespace(identity=identity))
     mol = Chem.RWMol()
     for number in (46, 6, 6, 6, 6, 6):
         mol.AddAtom(Chem.Atom(number))
@@ -314,7 +321,7 @@ def test_native_haptic_angle_mapping():
     mol.AddConformer(conf)
     mol = mol.GetMol()
     mapping = [5, 2, 4, 1, 0, 3]
-    refs, source = metal_angle_references(mol, mol, (None, isomer), mapping)
+    refs, source = metal_angle_references(mol, mol, (None, species), mapping)
     assert source == "endpoint_graph+native_state"
     assert len(refs[1]) == 1
     center, haptic, donor, angle = refs[1][0]

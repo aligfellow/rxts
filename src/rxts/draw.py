@@ -32,7 +32,10 @@ def _sketch(rea, mech):
     reactive = {i for pair in forming + breaking for i in pair}
 
     work = Chem.RWMol(rea)
-    # Note each reactive atom's index so it survives the renumbering when hydrogens are removed.
+    # Note each reactive atom's index so it survives the renumbering when hydrogens are removed; a species'
+    # own notes (its metal arrangement) are cleared first.
+    for atom in work.GetAtoms():
+        atom.ClearProp("atomNote")
     for i in reactive:
         work.GetAtomWithIdx(i).SetProp("atomNote", str(i))
 

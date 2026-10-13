@@ -38,6 +38,19 @@ def test_an_aromatic_nh_ring_still_draws():
     assert img.size == (400, 340)
 
 
+def test_beta_hydride_cx_draws():
+    """The Pd species' own atom notes (its arrangement) do not collide with the drawing's index labels."""
+    reactant = (
+        "C[P:5](C)(C)->[Pd+2:4](<-[CH2-:1][CH:2]([H:3])c1ccccc1)<-[P:6](C)(C)C "
+        "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1:14.atomNote.s3|"
+    )
+    product = (
+        "C[P:5](C)(C)->[Pd+2:4]1(<-[CH2:1]=[CH:2]->1c1ccccc1)(<-[H-:3])<-[P:6](C)(C)C "
+        "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1+:6.atomNote.s1+:13.atomNote.s2:14.atomNote.s3|"
+    )
+    assert draw_mechanisms(reactant, product).size == (400, 340)
+
+
 def test_draw_endpoint_structures():
     rea, pro, _mech = next(iter(_mechanism_mols("CC(=O)OC.O>>CC(=O)O.CO")))
     img = draw_mechanisms(rea, pro)

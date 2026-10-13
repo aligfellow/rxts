@@ -110,7 +110,7 @@ physical_guess = path.guess("qm")
 
 ## Metals and proton relays
 
-For metals, supply CXSMILES with explicit coordination sites or selected rxembed isomers/conformers. The [notebook](examples/quickstart.ipynb) shows compatible square-planar endpoints for a metal reaction. Plain SMILES alone does not resolve ambiguous ligand seating: when a geometry name fits several isomers, rxts raises and lists them rather than choose. Select one with `rxembed.metal(smiles, geometry).select(...)`; the notebook's coordination-isomer section tries each candidate and compares their peaks. Metal-angle holds come from those endpoints; `metal_angle_k=0` disables them. Hold energies are excluded from the reported FF profile.
+For metals, supply CXSMILES with explicit coordination sites or a selected rxembed species: one from `rxembed.isomers(...)` is embedded, and an embedded `Ensemble`'s `.mol` keeps its coordinates. The [notebook](examples/quickstart.ipynb) shows compatible square-planar endpoints for a metal reaction. Plain SMILES alone does not resolve ambiguous ligand seating: when a geometry name fits several isomers, rxts raises and lists them rather than choose. Select one with `rxembed.isomers(smiles, geometry=...).select(...)`; the notebook's coordination-isomer section tries each candidate and compares their peaks. Metal-angle holds come from those endpoints; `metal_angle_k=0` disables them. Hold energies are excluded from the reported FF profile.
 
 To add a water relay:
 

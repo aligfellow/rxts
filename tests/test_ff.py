@@ -72,14 +72,13 @@ def test_start_conformer_is_chosen_on_the_path(monkeypatch):
 
 
 def test_native_endpoints_are_prepared_once(monkeypatch):
-    rx = rxembed
     from rdkit import Chem
 
     guesser = rxts.TransitionStateGuesser(engine="mmff", multiplicity=1, n_lambda=3, n_cores=1)
     reference = guesser.prepare_endpoints("CBr.[Cl-]>>CCl.[Br-]")
-    native = tuple(
-        rx.Conformers(Chem.Mol(mol), [mol.GetConformer().GetId()]) for mol in (reference.reactant, reference.product)
-    )
+    native = (Chem.Mol(reference.reactant), Chem.Mol(reference.product))
+    for mol in native:
+        mol.SetBoolProp(PLACED, True)  # supplied geometry, as rxts marks it
     guesser.mapping = list(range(reference.reactant.GetNumAtoms()))
 
     def forbidden(*args, **kwargs):
@@ -805,57 +804,34 @@ def test_metal_core(monkeypatch):
     targets = {(3, 4): 3.0}
     assert metal_core(mol, x, targets) == [0, 1, 2, 3, 4]
     embed_candidates(mol, x, targets, n=4, n_cores=1)
-    assert seen == {"fix": [0, 1, 2, 3, 4], "n": 4, "threads": 1, "charge": 0, "seed": 0xF00D}
+    assert seen == {"fix": [0, 1, 2, 3, 4], "n": 4, "threads": 1, "seed": 0xF00D}
 
 
 def test_native_metal_sampling(monkeypatch):
     mol = mol_from_xyz(_PD_COMPLEX)
     x = mol.GetConformer().GetPositions()
     x[1, 0] += 0.1
-    constraints = object()
-    isomer = SimpleNamespace(
-        mol=Chem.Mol(mol),
-        centres=(object(),),
-        donor_bonds=[(1, 0)],
-        base_cons=constraints,
-        constrained_metals=frozenset({0}),
-        lengths="model",
-    )
+    species = Chem.Mol(mol)
+    species.GetAtomWithIdx(0).SetProp("atomNote", "SPL")  # the arrangement the selected species states
     captured = {}
 
-    def from_state(cls, source_mol, centres, donor_bonds, **kwargs):
-        captured["source_mol"] = source_mol
-        captured["centres"] = centres
-        captured["donor_bonds"] = donor_bonds
-        captured["state"] = kwargs
-        return SimpleNamespace(mol=source_mol)
-
-    def native_embed(source, **kwargs):
+    def embed(source, **kwargs):
         captured["source"] = source
         captured["options"] = kwargs
-        return SimpleNamespace(mol=source.mol, ids=[0])
+        return SimpleNamespace(mol=source, ids=[0])
 
-    monkeypatch.setattr(ff.rxembed.Isomer, "from_state", classmethod(from_state))
-    monkeypatch.setattr(ff.rxembed.core, "embed", native_embed)
-    monkeypatch.setattr(ff.rxembed, "embed", lambda *a, **k: pytest.fail("used charge-inferring facade"))
+    monkeypatch.setattr(ff.rxembed, "embed", embed)
 
-    proposals = embed_candidates(mol, x, targets={(1, 2): 2.5}, n=2, n_cores=1, seed=42, isomer=isomer)
+    proposals = embed_candidates(mol, x, targets={(1, 2): 2.5}, n=2, n_cores=1, seed=42, isomer=species)
 
-    np.testing.assert_array_equal(captured["source_mol"].GetConformer().GetPositions(), x)
-    assert captured["centres"] is isomer.centres
-    assert captured["donor_bonds"] is isomer.donor_bonds
-    assert captured["state"] == {
-        "constraints": constraints,
-        "constrained_metals": isomer.constrained_metals,
-        "lengths": "model",
-        "protect_arrangement": False,
-    }
+    np.testing.assert_array_equal(captured["source"].GetConformer().GetPositions(), x)
+    assert captured["source"].GetAtomWithIdx(0).GetProp("atomNote") == "SPL"
     assert captured["options"] == {"fix": [0, 1, 2, 3, 4], "seed": 42, "threads": 1, "n": 2}
     np.testing.assert_array_equal(proposals[0], x)
 
 
-@pytest.mark.parametrize(("smiles", "charge"), [("CCO", 0), ("CC[O-]", -1)])
-def test_organic_targets_are_windows_not_fixed_atoms(monkeypatch, smiles, charge):
+@pytest.mark.parametrize("smiles", ["CCO", "CC[O-]"])
+def test_organic_targets_are_windows_not_fixed_atoms(monkeypatch, smiles):
     mol = as_molecules(smiles)[0]
     seen = _capture_rxembed(monkeypatch)
     x = mol.GetConformer().GetPositions()
@@ -863,7 +839,7 @@ def test_organic_targets_are_windows_not_fixed_atoms(monkeypatch, smiles, charge
     assert metal_core(mol, x, targets) == []
     assert embed_candidates(mol, x, targets, n=4, n_cores=1)
     windows = seen.pop("fix")
-    assert seen == {"n": 4, "charge": charge, "seed": 0xF00D, "threads": 1}
+    assert seen == {"n": 4, "seed": 0xF00D, "threads": 1}
     assert windows.keys() == targets.keys()
     assert windows[(0, 1)] == pytest.approx((1.85, 1.95))
     assert windows[(1, 2)] == pytest.approx((1.65, 1.75))
@@ -938,7 +914,8 @@ def test_single_donor_metal_reembeds():
 
 
 def test_metal_proposals_preserve_core_and_isomer():
-    mol = rxembed.embed(rxembed.metal(_PD_SMILES, "square_planar").select(index=0), n=6, threads=1).lowest(1).mol
+    species = rxembed.isomers(_PD_SMILES, geometry="square_planar").select(index=0)
+    mol = rxembed.embed(species, n=6, threads=1).lowest(1).mol
     targets = {(0, 1): 2.6}
     x = _set_distance(mol.GetConformer().GetPositions(), (0, 1), targets[(0, 1)])
     core = metal_core(mol, x, targets)
