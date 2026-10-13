@@ -1449,7 +1449,7 @@ wheels = [
 [[package]]
 name = "rxembed"
 version = "0.1.4"
-source = { git = "https://github.com/aligfellow/rxembed#03460f5b4487bfeeaa543251fb85455c6d982549" }
+source = { git = "https://github.com/aligfellow/rxembed#fdb6ae8ffb170073e977787e0e71e4d25885a545" }
 dependencies = [
     { name = "networkx" },
     { name = "numpy" },
