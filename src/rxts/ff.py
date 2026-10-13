@@ -33,6 +33,7 @@ from rxts.evb import (
     mmff_can_type,
     untypeable_fragments,
 )
+from rxts.gfnff import in_process_available
 from rxts.mapping import bond_set
 from rxts.scoring import CalculatorMethod
 from rxts.structure import ReactionPath, _frame, method_label
@@ -380,8 +381,9 @@ class TransitionStateGuesser:
                     "Conformational transition states are implemented on the GFN-FF engine only. Pass engine='gfnff'."
                 )
 
-        if engine == "gfnff":
-            # GFN-FF perceives topology from coordinates, so a mismatched endpoint gives the wrong field.
+        if engine == "gfnff" and not in_process_available():
+            # The xtb subprocess perceives topology from coordinates, so a mismatched endpoint gives the wrong
+            # field. The linked library is handed each endpoint's graph instead.
             require_topology(rea, bond_set(rea), "reactant")
             require_topology(pro, bond_set(pro), "product")
 

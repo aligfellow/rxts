@@ -540,7 +540,7 @@ class GFNFFPotential(_ReactionPotential):
             self._bond[pair] = (side, bond_k, r_bonded)
             self._contact[pair] = table.GetRvdw(z[i]) + table.GetRvdw(z[j])
 
-        # Each calculator freezes its topology from the geometry it is given.
+        # Each calculator freezes its topology: the linked library from the graph, the subprocess from the geometry.
         self.rea = GFNFF(rea, charge=charge, solvent=solvent)
         self.pro = GFNFF(pro, charge=charge, solvent=solvent)
         self._pool = ThreadPoolExecutor(max_workers=2) if (n_cores or 2) > 1 else None

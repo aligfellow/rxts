@@ -24,7 +24,9 @@ class _StopError(Exception):
 
 
 @pytest.mark.parametrize("invalid_role", ["reactant", "product"])
-def test_gfnff_validates_topology_before_build(monkeypatch, invalid_role):
+@pytest.mark.parametrize("linked", [False, True])
+def test_gfnff_validates_topology_before_build(monkeypatch, invalid_role, linked):
+    """The xtb subprocess perceives bonds, so a stretched endpoint is refused; the linked library takes the graph."""
     from rxts.utils import mol_from_xyz
 
     geometry = """5
@@ -41,13 +43,14 @@ Cl  0.000 -2.300  0.000
     invalid = set_positions(valid, positions)
     reactant, product = (invalid, valid) if invalid_role == "reactant" else (valid, invalid)
 
-    monkeypatch.setattr(
-        ff,
-        "GFNFFPotential",
-        lambda **kwargs: pytest.fail("invalid endpoint reached GFN-FF field construction"),
-    )
+    monkeypatch.setattr(ff, "in_process_available", lambda: linked)
+
+    def built(**kwargs):
+        raise _StopError
+
+    monkeypatch.setattr(ff, "GFNFFPotential", built)
     guesser = rxts.TransitionStateGuesser(engine="gfnff", multiplicity=1)
-    with pytest.raises(ValueError, match="does not have the bonding it should"):
+    with pytest.raises(_StopError if linked else ValueError, match=None if linked else "does not have the bonding"):
         guesser._build_potential("gfnff", reactant, product, [(0, 1)], [], charge=0)
 
 
