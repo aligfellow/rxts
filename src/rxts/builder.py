@@ -582,12 +582,16 @@ def select_metal_state(spec, geometry=None):
             metals = metal_atoms(graph)
             if not all(graph.GetAtomWithIdx(m).HasProp("atomNote") for m in metals):
                 raise ValueError("Coordinate-free metal endpoints need geometry= or selected native CX/Isomer state")
-        iso = rxembed.metal(
+        isomers = rxembed.metal(
             graph,
             geometry,
             center="all" if len(metal_atoms(graph)) > 1 else None,
             observed_only=bool(graph.GetNumConformers()),
-        ).select()
+        )
+        if len(isomers) > 1:
+            labels = ", ".join(iso.label or f"#{k}" for k, iso in enumerate(isomers))
+            raise ValueError(f"{len(isomers)} isomers fit ({labels}); pass one from rxembed.metal(...).select(...)")
+        iso = isomers.select()
     else:
         raise TypeError("Select one rxembed isomer and conformer before preparing the reaction")
 
@@ -616,6 +620,45 @@ def relax_metal_endpoint(isomer, reactant, mapping):
     return set_positions(product, _align(product.GetConformer().GetPositions(), reference))
 
 
+def _graph_only(spec):
+    """Whether rxts must build this endpoint's geometry: SMILES, or a Mol without coordinates."""
+    if isinstance(spec, (list, tuple)):
+        return all(_graph_only(part) for part in spec)
+    if isinstance(spec, str):
+        return not _is_xyz_input(spec)
+    return isinstance(spec, Chem.Mol) and not spec.GetNumConformers()
+
+
+def _mapped(side, maps):
+    """Return a copy of a selected state or graph whose atom maps pin rxts's mapping."""
+    side = deepcopy(side)
+    mols = (side.mol, side.graph) if isinstance(side, rxembed.Isomer) else (side,)
+    for mol in mols:
+        Chem.GetSymmSSSR(mol)  # combined fragments carry no ring info
+        for atom, number in zip(mol.GetAtoms(), maps, strict=True):
+            atom.SetAtomMapNum(number)
+    return side
+
+
+def _coembed_endpoints(sides, mapping, charge, seed):
+    """Embed both endpoints as one tied rxembed system and return them in the reactant's atom order.
+
+    `sides` are each endpoint's selected state, or its graph when it has no metal, in its own atom order. Atom
+    maps carry rxts's mapping through rxembed (reactant atom r is r + 1; product atom p is mapping[p] + 1), and
+    every returned atom keeps its map, so ordering by map restores the reactant's order.
+    """
+    n = len(mapping)
+    sides = (_mapped(sides[0], range(1, n + 1)), _mapped(sides[1], [r + 1 for r in mapping]))
+    left, right = rxembed.coembed(sides, charge=charge, n=1, seed=seed, threads=1)
+    cid = int(left.ids[0])
+    paired = []
+    for ensemble in (left, right):
+        order = sorted(range(n), key=lambda i: ensemble.mol.GetAtomWithIdx(i).GetAtomMapNum())
+        mol = selected_endpoint(rxembed.Conformers(Chem.Mol(ensemble.mol, confId=cid), [cid], iso=ensemble.iso))
+        paired.append(Chem.RenumberAtoms(mol, order))
+    return paired
+
+
 def prepare_endpoints(
     reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | Conformers | Isomer,
     product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | Conformers | Isomer | None = None,
@@ -633,8 +676,9 @@ def prepare_endpoints(
 ) -> PreparedReaction:
     """Map endpoints and prepare matching graphs and coordinates without scanning or QM.
 
-    Native source objects keep their original atom order. Isomer/CX or geometry requests derive the product
-    from the mapped reactant seed; placed conformers retain their coordinates.
+    Endpoints without coordinates, including selected rxembed Isomers, are embedded together as one tied rxembed
+    system in the reactant's atom order. Placed conformers retain their coordinates, and native source objects
+    keep their original atom order.
     """
     _validate_declared_context(charge, multiplicity)
     if multiplicity is None:
@@ -681,7 +725,19 @@ def prepare_endpoints(
     rea_state, reactant, rea_request = select_metal_state(reactant, reactant_geometry)
     pro_state, product, pro_request = select_metal_state(product, product_geometry)
     native_pair = rea_request or pro_request
-    if native_pair:
+    paired = None
+    if _graph_only(reactant) and _graph_only(product):
+        sides = tuple(
+            graph if state is None else state
+            for state, graph in ((rea_state, reactant_graph), (pro_state, product_graph))
+        )
+        paired = _coembed_endpoints(sides, mapping, charge, seed)
+        for mol in paired:  # the caller's own maps, in the reactant's order
+            for atom, source in zip(mol.GetAtoms(), reactant_graph.GetAtoms(), strict=True):
+                atom.SetAtomMapNum(source.GetAtomMapNum())
+    if paired is not None:
+        rea, pro = paired
+    elif native_pair:
         if rea_state is None or pro_state is None:
             raise ValueError("Native paired preparation requires a selected coordination state at both endpoints")
         if not reactant.GetNumConformers():
@@ -709,8 +765,9 @@ def prepare_endpoints(
                 else combine_spaced(as_molecules(product, seed=seed))
             )
 
-    # Keep product atoms and coordinates in the reactant's index space.
-    pro = Chem.RenumberAtoms(pro, invert(mapping))
+    if paired is None:
+        # Keep product atoms and coordinates in the reactant's index space.
+        pro = Chem.RenumberAtoms(pro, invert(mapping))
     forming, breaking = reaction_bonds(rea, pro, list(range(rea.GetNumAtoms())))
     if forming_bonds is not None:
         forming = {tuple(sorted(p)) for p in forming_bonds}
@@ -726,7 +783,7 @@ def prepare_endpoints(
     for pair in sorted(forming):
         logger.info(f"  forming   {describe(rea, pair)}")
 
-    if not native_pair and (not _geometry_known(reactant) or not _geometry_known(product)):
+    if paired is None and not native_pair and (not _geometry_known(reactant) or not _geometry_known(product)):
         # Choose the attack face before contact relaxation; later distance restraints do not set it.
         rea = search_approach(
             mol=rea,

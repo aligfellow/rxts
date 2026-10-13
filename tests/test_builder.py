@@ -603,8 +603,8 @@ def test_native_coords_use_native_cleanup(monkeypatch):
         relax_metal_endpoint(iso, set_positions(seed, coords), list(range(seed.GetNumAtoms())))
 
 
-@pytest.mark.parametrize("placed_reactant", [False, True])
-def test_native_isomers_skip_embedding(monkeypatch, placed_reactant):
+def test_native_isomers_skip_embedding(monkeypatch):
+    """A placed native reactant keeps its coordinates and derives the product; unplaced isomers are co-embedded."""
     from rdkit import Chem
 
     module = builder
@@ -631,7 +631,7 @@ def test_native_isomers_skip_embedding(monkeypatch, placed_reactant):
         def mol(self):
             return Chem.Mol(self._mol)
 
-    rea_source = Native(rea, [0], Isomer(rea)) if placed_reactant else Isomer(rea)
+    rea_source = Native(rea, [0], Isomer(rea))
     sources = (rea_source, Isomer(pro))
     seen = []
 
@@ -663,19 +663,16 @@ def test_native_isomers_skip_embedding(monkeypatch, placed_reactant):
     for name in ("as_molecules", "search_approach", "reactive_complex", "derive_product_geometry"):
         monkeypatch.setattr(builder, name, forbidden)
     prepared = prepare_endpoints(*sources, multiplicity=1, mapping=mapping, n_cores=1)
-    assert seen == (["minimize"] if placed_reactant else ["embed", "minimize"])
+    assert seen == ["minimize"]
     assert prepared.sources[0] is sources[0]
     assert prepared.sources[1] is sources[1]
     assert prepared.mapping == mapping
     np.testing.assert_allclose(
         prepared.product.GetConformer().GetPositions(), rea.GetConformer().GetPositions(), atol=1e-12
     )
-    assert sources[0].mol.GetNumConformers() == (1 if placed_reactant else 0)
+    assert sources[0].mol.GetNumConformers() == 1
     assert sources[1].mol.GetNumConformers() == 0
-    if placed_reactant:
-        np.testing.assert_array_equal(
-            prepared.reactant.GetConformer().GetPositions(), rea.GetConformer().GetPositions()
-        )
+    np.testing.assert_array_equal(prepared.reactant.GetConformer().GetPositions(), rea.GetConformer().GetPositions())
 
 
 def test_native_selection_handles_ambiguity(monkeypatch):
@@ -893,7 +890,7 @@ def test_cx_identity_precedes_embedding():
     assert graph.GetNumConformers() == 0
     assert restored.geometry == selected.geometry
     assert rx.cxsmiles(restored) == cx
-    with pytest.raises(ValueError, match=r"matched .* isomer"):
+    with pytest.raises(ValueError, match="2 isomers fit"):
         select_metal_state("[Cl-]->[Pd+2](<-[Cl-])(<-[NH3])<-[NH3]", "SPL")
     placed = rx.Conformers(selected.mol, [], iso=selected)
     with pytest.raises(ValueError, match="exactly one"):
@@ -1074,3 +1071,61 @@ def test_xyz_context_validates_before_read(monkeypatch):
         prepare_endpoints(Path("reactant.coord"), Path("product.coord"), multiplicity=1)
     with pytest.raises(ValueError, match="both endpoints"):
         prepare_endpoints("2\n\nH 0 0 0\nH .74 0 0\n", "[H][H]", charge=0, multiplicity=1)
+
+
+_BETA_R = (
+    "C[P:5](C)(C)->[Pd+2:4](<-[CH2-:1][CH:2]([H:3])c1ccccc1)<-[P:6](C)(C)C "
+    "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1:14.atomNote.s3|"
+)
+_BETA_P = (
+    "C[P:5](C)(C)->[Pd+2:4]1(<-[CH2:1]=[CH:2]->1c1ccccc1)(<-[H-:3])<-[P:6](C)(C)C "
+    "|atomProp:1.atomNote.s0:4.atomNote.SPL:5.atomNote.s1+:6.atomNote.s1+:13.atomNote.s2:14.atomNote.s3|"
+)
+
+
+def _forbid(monkeypatch, *names):
+    def forbidden(*args, **kwargs):
+        pytest.fail("coembed alignment reached the sequential builder")
+
+    for name in names:
+        monkeypatch.setattr(builder, name, forbidden)
+
+
+def test_unplaced_endpoints_are_coembedded(monkeypatch):
+    """Unplaced endpoints come from one tied rxembed system, already in the reactant's order."""
+    _forbid(monkeypatch, "search_approach", "reactive_complex", "derive_product_geometry")
+    prepared = prepare_endpoints("CBr.[Cl-]>>CCl.[Br-]", multiplicity=1)
+    sym = [a.GetSymbol() for a in prepared.reactant.GetAtoms()]
+    assert [a.GetSymbol() for a in prepared.product.GetAtoms()] == sym
+    assert [sorted((sym[i], sym[j])) for i, j in prepared.forming_bonds] == [["C", "Cl"]]
+    assert [sorted((sym[i], sym[j])) for i, j in prepared.breaking_bonds] == [["Br", "C"]]
+    assert all(a.GetAtomMapNum() == 0 for m in (prepared.reactant, prepared.product) for a in m.GetAtoms())
+
+
+def test_coembed_keeps_the_selected_metal_state(monkeypatch):
+    """A CX metal pair co-embeds as the isomers its notes select, without the sequential product relax."""
+    _forbid(monkeypatch, "relax_metal_endpoint")
+    prepared = prepare_endpoints(_BETA_R, _BETA_P, multiplicity=1)
+    pd = next(a.GetIdx() for a in prepared.product.GetAtoms() if a.GetSymbol() == "Pd")
+    alkene = [n.GetIdx() for n in prepared.product.GetAtomWithIdx(pd).GetNeighbors() if n.GetSymbol() == "C"]
+    x = prepared.product.GetConformer().GetPositions()
+    assert len(alkene) == 2
+    assert all(1.9 < np.linalg.norm(x[pd] - x[c]) < 2.5 for c in alkene)  # side-on, both carbons at Pd
+
+
+def test_selected_isomers_are_coembedded(monkeypatch):
+    """User-selected, unmapped Isomers co-embed in rxts's order and keep their selected states."""
+    rx = builder.rxembed
+    _forbid(monkeypatch, "relax_metal_endpoint")
+    isomers = [rx.metal(Chem.AddHs(rx.parse_smiles(s, remove_hs=False))).select() for s in (_BETA_R, _BETA_P)]
+    prepared = prepare_endpoints(*isomers, multiplicity=1)
+    assert [a.GetSymbol() for a in prepared.reactant.GetAtoms()] == [
+        a.GetSymbol() for a in isomers[0].restore().GetAtoms()
+    ]
+    assert [a.GetSymbol() for a in prepared.product.GetAtoms()] == [a.GetSymbol() for a in prepared.reactant.GetAtoms()]
+    sym = [a.GetSymbol() for a in prepared.reactant.GetAtoms()]
+    assert sorted(sorted((sym[i], sym[j])) for i, j in prepared.forming_bonds) == [["C", "Pd"], ["H", "Pd"]]
+    assert [sorted((sym[i], sym[j])) for i, j in prepared.breaking_bonds] == [["C", "H"]]
+    own = [a.GetAtomMapNum() for a in isomers[0].restore().GetAtoms()]  # the caller's maps, not the pinning ones
+    assert [a.GetAtomMapNum() for a in prepared.reactant.GetAtoms()] == own
+    assert [a.GetAtomMapNum() for a in prepared.product.GetAtoms()] == own

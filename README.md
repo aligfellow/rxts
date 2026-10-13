@@ -28,7 +28,7 @@ guess.dump("guess.xyz")
 path.dump("path.xyz")
 ```
 
-The result is an FF path and a candidate geometry, not a verified saddle point. `find_transition_state` follows VeloxChem's naming. Inputs can be reaction SMILES, separate reactant/product SMILES, RDKit molecules, XYZ files or selected rxembed structures. Declare `multiplicity`; XYZ inputs also need an explicit `charge`.
+The result is an FF path and a candidate geometry, not a verified saddle point. `find_transition_state` follows VeloxChem's naming. Inputs can be reaction SMILES, separate reactant/product SMILES, RDKit molecules, XYZ files or selected rxembed structures. Endpoints given without coordinates are embedded together as one tied system (`rxembed.coembed`), so both start aligned in the mapped atom order. Declare `multiplicity`; XYZ inputs also need an explicit `charge`.
 
 Mapping is independently callable, without geometry construction:
 
@@ -110,7 +110,7 @@ physical_guess = path.guess("qm")
 
 ## Metals and proton relays
 
-For metals, supply CXSMILES with explicit coordination sites or selected rxembed isomers/conformers. The [notebook](examples/quickstart.ipynb) shows compatible square-planar endpoints for a metal reaction. Plain SMILES alone does not resolve ambiguous ligand seating. Metal-angle holds come from those endpoints; `metal_angle_k=0` disables them. Hold energies are excluded from the reported FF profile.
+For metals, supply CXSMILES with explicit coordination sites or selected rxembed isomers/conformers. The [notebook](examples/quickstart.ipynb) shows compatible square-planar endpoints for a metal reaction. Plain SMILES alone does not resolve ambiguous ligand seating: when a geometry name fits several isomers, rxts raises and lists them rather than choose. Select one with `rxembed.metal(smiles, geometry).select(...)`; the notebook's coordination-isomer section tries each candidate and compares their peaks. Metal-angle holds come from those endpoints; `metal_angle_k=0` disables them. Hold energies are excluded from the reported FF profile.
 
 To add a water relay:
 
