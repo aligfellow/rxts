@@ -498,7 +498,7 @@ wheels = [
 [[package]]
 name = "gfnff"
 version = "0.3.0"
-source = { git = "https://github.com/pprcht/gfnff#542388132ae2f0be1bd3134b37e6233d30f2a60f" }
+source = { git = "https://github.com/aligfellow/gfnff?rev=graph-metal-filters#bcacaf229105b513a2ae16a43c058d578e3abb3f" }
 dependencies = [
     { name = "numpy" },
 ]
@@ -1493,7 +1493,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ase", specifier = ">=3.22" },
-    { name = "gfnff", marker = "extra == 'ff'", git = "https://github.com/pprcht/gfnff" },
+    { name = "gfnff", marker = "extra == 'ff'", git = "https://github.com/aligfellow/gfnff?rev=graph-metal-filters" },
     { name = "networkx", specifier = ">=3.0" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pillow" },

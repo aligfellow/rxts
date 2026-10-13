@@ -28,7 +28,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-ff = ["gfnff @ git+https://github.com/pprcht/gfnff"]
+ff = ["gfnff @ git+https://github.com/aligfellow/gfnff@graph-metal-filters"]
 viz = ["plotprofile>=2.0.0", "xyzrender>=0.3"]
 
 [project.scripts]
