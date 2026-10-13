@@ -1,6 +1,7 @@
 """GFN-FF fields with topology frozen in memory or in ``gfnff_topo``.
 
-Validate seed geometries with utils.require_topology before freezing their perceived bonds.
+The linked library is handed the molecule's bond graph. The xtb subprocess perceives bonds from
+coordinates, so validate its seed geometries with utils.require_topology first.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ def in_process_available():
 
 
 class GFNFF:
-    """Freeze a molecule's perceived topology; charge is total charge and solvent an ALPB name."""
+    """Freeze a molecule's topology; charge is total charge and solvent an ALPB name."""
 
     def __new__(cls, *args, **kwargs):
         """Pick the backend: the linked library if available, the subprocess otherwise."""
@@ -68,7 +69,7 @@ class GFNFF:
 
 
 class _LinkedGFNFF(GFNFF):
-    """The linked C API builds topology once; singlepoint cannot rebuild it."""
+    """The linked C API builds topology once, from the bond graph; singlepoint cannot rebuild it."""
 
     def __init__(self, mol, charge=0, solvent=None):
         super().__init__(mol=mol, charge=charge, solvent=solvent)
@@ -87,6 +88,7 @@ class _LinkedGFNFF(GFNFF):
                 solvent=solvent or "",
                 printlevel=0,
                 ref_charges=ref_charges,
+                bond_matrix=Chem.GetAdjacencyMatrix(mol),  # the declared graph, not distance perception
             )
         except TypeError as exc:
             if "ref_charges" in str(exc):

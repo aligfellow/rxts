@@ -88,6 +88,69 @@ def test_linked_ff_uses_formal_charges(monkeypatch):
     assert charges.tolist() == [1.0, -1.0]
 
 
+def test_linked_ff_takes_the_graph(monkeypatch):
+    """The linked field is built on the declared bonds, dative ones included, not on distances."""
+    from types import SimpleNamespace
+
+    molecule = Chem.MolFromSmiles("[NH3]->[Pd]")
+    molecule.AddConformer(Chem.Conformer(molecule.GetNumAtoms()))  # all atoms at the origin
+    captured = {}
+    calculator = SimpleNamespace(GFNFFCalculator=lambda *args, **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(gfnff, "import_module", lambda _: calculator)
+    gfnff._LinkedGFNFF(molecule, charge=0)
+
+    assert captured["bond_matrix"].tolist() == [[0, 1], [1, 0]]
+
+
+# Pd(PH3)2(H)(eta2-C2H4)+ from rxembed (SPL); atom order is Chem.AddHs of the SMILES below.
+_ETA2_SMILES = "[PH3]->[Pd+2]1(<-[CH2]=[CH2]->1)(<-[H-])<-[PH3]"
+_ETA2_XYZ = [
+    [-0.859, 1.664, 1.519],
+    [-0.669, -0.073, 0.068],
+    [1.484, -0.413, 0.517],
+    [1.422, 0.451, -0.503],
+    [-2.241, -0.285, 0.284],
+    [-0.794, -1.792, -1.411],
+    [0.233, 2.188, 2.411],
+    [-1.051, 2.813, 0.568],
+    [-2.066, 1.799, 2.406],
+    [1.524, -0.055, 1.540],
+    [1.551, -1.479, 0.332],
+    [1.440, 0.095, -1.527],
+    [1.414, 1.519, -0.320],
+    [-1.982, -2.714, -1.421],
+    [0.325, -2.733, -1.762],
+    [-0.979, -1.045, -2.703],
+]
+
+
+@pytest.mark.skipif(not gfnff.in_process_available(), reason="needs the linked GFN-FF library")
+def test_graph_field_matches_perception_for_eta2():
+    """Where GFN-FF perceives exactly the declared bonds, the graph must build the same field.
+
+    The trap is eta coordination: GFN-FF types an eta carbon from its metal-free neighbour list, so a
+    graph path that skips the metal filter types it sp3 and loses the pi system (gfnff 0.3.0 @ 5423881).
+    """
+    from importlib import import_module
+
+    from rxts.utils import perceived_bonds, with_conformer
+
+    mol = with_conformer(Chem.AddHs(Chem.MolFromSmiles(_ETA2_SMILES)), np.array(_ETA2_XYZ))
+    assert perceived_bonds(mol) == {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))) for b in mol.GetBonds()}
+
+    x = np.array(_ETA2_XYZ)
+    numbers = np.array([a.GetAtomicNum() for a in mol.GetAtoms()], dtype=np.int32)
+    charges = np.array([a.GetFormalCharge() for a in mol.GetAtoms()], dtype=np.float64)
+    perceived = import_module("gfnff").GFNFFCalculator(
+        numbers, x / gfnff.BOHR, charge=1, printlevel=0, ref_charges=charges
+    )
+    e_ref, g_ref, _ = perceived.singlepoint(numbers, x / gfnff.BOHR)
+
+    energy, gradient = gfnff._LinkedGFNFF(mol, charge=1).energy_grad(x)
+    assert energy == pytest.approx(e_ref * gfnff.HARTREE_TO_KCAL, abs=1e-6)
+    assert np.allclose(gradient, g_ref * (gfnff.HARTREE_TO_KCAL / gfnff.BOHR), atol=1e-6)
+
+
 def test_subprocess_rejects_fragment_charge(monkeypatch):
     """The CLI exposes net charge only; do not let it guess charge placement across fragments."""
     molecule = Chem.MolFromSmiles("[Na+].[Cl-]")
