@@ -50,17 +50,14 @@ def test_native_embedding_preserves_identity(monkeypatch):
             self.unrelaxed = []
             self.mol = mol
 
-    class CandidateSet(list):
-        pass
-
+    with pytest.raises(ValueError, match="stereoisomers"):  # several stereoisomers are refused, not chosen
+        as_molecules("CC(F)Cl")
     calls = []
     mode = "ok"
 
     def embed(source, **options):
         calls.append((source, options))
         result = NativeResult(embedded)
-        if mode == "ambiguous":
-            return CandidateSet([result])
         if mode == "unrelaxed":
             result.unrelaxed = [0]
         if mode in {"changed", "radical"}:
@@ -72,8 +69,7 @@ def test_native_embedding_preserves_identity(monkeypatch):
             return NativeResult(changed)
         return result
 
-    native = SimpleNamespace(Conformers=NativeResult, EnsembleSet=CandidateSet, embed=embed)
-    monkeypatch.setattr(builder, "rxembed", native)
+    monkeypatch.setattr(builder, "rxembed", SimpleNamespace(embed=embed))
     result = as_molecules(graph, seed=42)[0]
 
     assert calls[0][0].GetNumAtoms() == graph.GetNumAtoms()
@@ -89,9 +85,6 @@ def test_native_embedding_preserves_identity(monkeypatch):
     assert result.GetNumConformers() == 1
     assert not result.HasProp(PLACED)
 
-    mode = "ambiguous"
-    with pytest.raises(ValueError, match="select one native isomer and conformer"):
-        as_molecules(graph, seed=42)
     mode = "unrelaxed"
     with pytest.raises(ValueError, match="unrelaxed conformer"):
         as_molecules(graph, seed=42)
@@ -449,24 +442,18 @@ def test_wrapper_reuses_placed_preparation(monkeypatch, as_xyz):
     assert direct.mapping == [0, 1, 2]
 
 
-def test_native_metal_identity_uses_mapped_indices(monkeypatch):
-    from rdkit import Chem
+def test_native_metal_identity_uses_mapped_indices():
+    import rxembed as rx
 
-    class Isomer:
-        mol = Chem.MolFromSmiles("NCN")
-        centres = (SimpleNamespace(atom=1, atomic_num=46, charge=2, geometry="linear", vertices=(0, 2), hand=""),)
-
-        def restore(self):
-            return Chem.MolFromSmiles("N->[Pd+2]<-N")
-
-    monkeypatch.setattr(builder, "rxembed", SimpleNamespace(Isomer=Isomer))
-    charge, graph = builder._declared_endpoint(Isomer())
+    species = rx.isomers("N->[Pd+2]<-N", geometry="linear").select()
+    charge, graph = builder._declared_endpoint(species)
     assert charge == 2
     assert graph.GetAtomWithIdx(1).GetAtomicNum() == 46
-    identity = builder._metal_identity(Isomer(), [2, 0, 1])
+    identity = builder._metal_identity(species, [2, 0, 1])
     centre = identity["centres"][0]
     assert centre["atom"] == 1
     assert centre["mapped_atom"] == 0
+    assert (centre["atomic_number"], centre["charge"], centre["geometry"], centre["hand"]) == (46, 2, "linear", "")
     assert centre["vertices"] == [{"atom": 0, "mapped_atom": 2}, {"atom": 2, "mapped_atom": 1}]
 
 
@@ -587,20 +574,20 @@ def test_named_bonds_match_topology(monkeypatch):
         )
 
 
-def test_native_coords_use_native_cleanup(monkeypatch):
+def test_native_coords_use_native_cleanup():
     import rxembed as rx
     from rdkit import Chem
 
-    iso = rx.metal(_PD_SMILES, "SPL").select(index=0)
-    iso.mol.AddConformer(Chem.Conformer(iso.mol.GetNumAtoms()))
-    iso.mol.AddConformer(iso.mol.GetConformer(), assignId=True)
-    with pytest.raises(ValueError, match="exactly one native Isomer"):
-        select_metal_state(iso)
+    species = Chem.Mol(rx.isomers(_PD_SMILES, geometry="SPL").select(index=0))
+    species.AddConformer(Chem.Conformer(species.GetNumAtoms()), assignId=True)
+    species.AddConformer(species.GetConformer(), assignId=True)
+    with pytest.raises(ValueError, match="exactly one conformer"):
+        select_metal_state(species)
     seed = mol_from_xyz(_PD_COMPLEX)
     coords = seed.GetConformer().GetPositions()
     coords[0, 0] = np.nan
     with pytest.raises(ValueError, match="nonfinite"):
-        relax_metal_endpoint(iso, set_positions(seed, coords), list(range(seed.GetNumAtoms())))
+        relax_metal_endpoint(species, set_positions(seed, coords), list(range(seed.GetNumAtoms())))
 
 
 def test_native_isomers_skip_embedding(monkeypatch):
@@ -608,51 +595,35 @@ def test_native_isomers_skip_embedding(monkeypatch):
     from rdkit import Chem
 
     module = builder
-    from rxts.utils import set_positions, with_conformer
+    from rxts.utils import FROM_COORDINATES, set_positions
 
     rea = mol_from_xyz("3\n\nPd 0 0 0\nN 2 0 0\nCl 0 2.3 0\n")
+    rea.ClearProp(FROM_COORDINATES)  # a selected species, not an XYZ endpoint
+    rea.GetAtomWithIdx(0).SetProp("atomNote", "SPL")  # the arrangement it states
     mapping = [2, 0, 1]
     pro = Chem.RenumberAtoms(rea, mapping)
-
-    class Isomer:
-        def restore(self):
-            return Chem.Mol(self.mol)
-
-        def __init__(self, mol):
-            self.mol = Chem.Mol(mol)
-            self.mol.RemoveAllConformers()
-            self.centres = ()
-
-    class Native:
-        def __init__(self, mol, ids, iso=None):
-            self._mol, self.ids, self.iso, self.unrelaxed = mol, ids, iso, []
-
-        @property
-        def mol(self):
-            return Chem.Mol(self._mol)
-
-    rea_source = Native(rea, [0], Isomer(rea))
-    sources = (rea_source, Isomer(pro))
+    pro.RemoveAllConformers()
+    sources = (rea, pro)
     seen = []
 
-    def embed(iso, **kwargs):
-        assert iso is not sources[0]
-        assert kwargs == {"n": 1, "seed": 61453, "threads": 1}
-        seen.append("embed")
-        return Native(with_conformer(iso.mol, rea.GetConformer().GetPositions()), [0], iso)
+    class Found(list):
+        def select(self):
+            return self[0]
 
-    def minimize(iso):
-        assert iso is not sources[1]
+    def isomers(graph, **kwargs):
+        return Found([Chem.Mol(graph)])
+
+    def minimize(seeded):
+        assert seeded is not sources[1]
         coords = rea.GetConformer().GetPositions()[mapping]
-        np.testing.assert_array_equal(iso.mol.GetConformer().GetPositions(), coords)
+        np.testing.assert_array_equal(seeded.GetConformer().GetPositions(), coords)
         seen.append("minimize")
-        return Native(set_positions(iso.mol, coords + np.array([5, 3, 2])), [0], iso)
+        return SimpleNamespace(ids=[0], unrelaxed=[], mol=set_positions(seeded, coords + np.array([5, 3, 2])))
 
     fake = SimpleNamespace(
-        Isomer=Isomer,
-        Conformers=Native,
-        EnsembleSet=module.rxembed.EnsembleSet,
-        embed=embed,
+        isomers=isomers,
+        identity=lambda mol: SimpleNamespace(centres=()),
+        embed=lambda *args, **kwargs: seen.append("embed"),
         minimize=minimize,
     )
     monkeypatch.setattr(module, "rxembed", fake)
@@ -670,8 +641,8 @@ def test_native_isomers_skip_embedding(monkeypatch):
     np.testing.assert_allclose(
         prepared.product.GetConformer().GetPositions(), rea.GetConformer().GetPositions(), atol=1e-12
     )
-    assert sources[0].mol.GetNumConformers() == 1
-    assert sources[1].mol.GetNumConformers() == 0
+    assert sources[0].GetNumConformers() == 1
+    assert sources[1].GetNumConformers() == 0
     np.testing.assert_array_equal(prepared.reactant.GetConformer().GetPositions(), rea.GetConformer().GetPositions())
 
 
@@ -682,42 +653,40 @@ def test_native_selection_handles_ambiguity(monkeypatch):
 
     source = "[Cl-]->[Pd+2].[Cl-]->[Pd+2]"
     seen = []
-    iso = SimpleNamespace(centres=(SimpleNamespace(atom=1), SimpleNamespace(atom=3)))
+    species = Chem.MolFromSmiles(source)
 
     class Choices(list):
         def select(self, **kwargs):
             seen.append(("select", kwargs))
             if ambiguous:
                 raise ValueError("matched 2 isomers; select the native arrangement")
-            return iso
-
-    class Isomer:
-        pass
-
-    class Native:
-        pass
+            return species
 
     def parse(spec, **kwargs):
         assert kwargs == {"remove_hs": False}
         seen.append(("parse", spec))
         return Chem.MolFromSmiles(spec)
 
-    def metal(graph, geometry, **kwargs):
+    def isomers(graph, **kwargs):
         assert graph.GetNumConformers() == 0
-        assert kwargs == {"center": "all", "observed_only": False}
-        seen.append(("metal", geometry))
-        return Choices([iso])
+        assert kwargs == {"geometry": "SPL", "center": "all", "observed": False}
+        seen.append(("isomers", kwargs["geometry"]))
+        return Choices([species])
 
-    fake = SimpleNamespace(Isomer=Isomer, Conformers=Native, parse_smiles=parse, metal=metal, IsomerSet=Choices)
+    def identity(mol):
+        assert mol is species
+        return SimpleNamespace(centres=(SimpleNamespace(atom=1), SimpleNamespace(atom=3)))
+
+    fake = SimpleNamespace(parse_smiles=parse, isomers=isomers, identity=identity)
     monkeypatch.setattr(module, "rxembed", fake)
     ambiguous = False
     selected, graph, requested = module.select_metal_state(source, "SPL")
-    assert selected is iso
+    assert selected is species
     assert requested
     assert graph.GetNumAtoms() == 4
     assert seen == [
         ("parse", source),
-        ("metal", "SPL"),
+        ("isomers", "SPL"),
         ("select", {}),
         ("select", {"geometry": "SPL", "center": 1}),
         ("select", {"geometry": "SPL", "center": 3}),
@@ -728,8 +697,6 @@ def test_native_selection_handles_ambiguity(monkeypatch):
 
 
 def test_native_product_seed_identity(monkeypatch):
-    from copy import deepcopy
-
     from rdkit import Chem
 
     module = builder
@@ -737,46 +704,43 @@ def test_native_product_seed_identity(monkeypatch):
     rea = mol_from_xyz(_PD_COMPLEX)
     mapping = [2, 4, 0, 1, 3]
     pro = Chem.RenumberAtoms(rea, mapping)
-    iso = SimpleNamespace(mol=pro, seating=((0, 1, 2),), hand="selected")
-    original = deepcopy(iso)
+    pro.GetAtomWithIdx(metal_atoms(pro)[0]).SetProp("atomNote", "SPL")  # the selected arrangement
+    original = Chem.Mol(pro)
     calls = []
 
+    def notes(mol):
+        return [atom.GetPropsAsDict().get("atomNote") for atom in mol.GetAtoms()]
+
     def minimize(seeded):
-        assert seeded is not iso
-        assert seeded.mol is not iso.mol
-        assert seeded.seating == iso.seating
-        assert seeded.hand == iso.hand
+        assert seeded is not pro
+        assert notes(seeded) == notes(pro)
         reference = rea.GetConformer().GetPositions()[mapping]
-        np.testing.assert_array_equal(seeded.mol.GetConformer().GetPositions(), reference)
+        np.testing.assert_array_equal(seeded.GetConformer().GetPositions(), reference)
         calls.append(seeded)
         transformed = reference @ np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]) + [8, 3, 2]
-        return SimpleNamespace(mol=set_positions(seeded.mol, transformed))
+        return SimpleNamespace(mol=set_positions(seeded, transformed))
 
-    fake = SimpleNamespace(
-        minimize=minimize,
-        Conformers=lambda mol, ids, iso: SimpleNamespace(mol=mol),
-    )
+    fake = SimpleNamespace(minimize=minimize)
     monkeypatch.setattr(module, "rxembed", fake)
     monkeypatch.setattr(module, "selected_endpoint", lambda result, expected: result.mol)
-    result = module.relax_metal_endpoint(iso, rea, mapping)
+    result = module.relax_metal_endpoint(pro, rea, mapping)
     assert len(calls) == 1
     np.testing.assert_allclose(
         result.GetConformer().GetPositions(), rea.GetConformer().GetPositions()[mapping], atol=1e-12
     )
-    np.testing.assert_array_equal(iso.mol.GetConformer().GetPositions(), original.mol.GetConformer().GetPositions())
-    assert iso.seating == original.seating
-    assert iso.hand == original.hand
-    assert bond_set(result) == bond_set(pro)
+    np.testing.assert_array_equal(pro.GetConformer().GetPositions(), original.GetConformer().GetPositions())
+    assert notes(pro) == notes(original)
+    assert bond_set(result) == bond_set(original)
 
     def failed(seed):
         raise RuntimeError("native state cannot be realised")
 
     fake.minimize = failed
     with pytest.raises(RuntimeError, match="cannot be realised"):
-        module.relax_metal_endpoint(iso, rea, mapping)
+        module.relax_metal_endpoint(pro, rea, mapping)
 
 
-def test_native_selection_identity(monkeypatch):
+def test_native_selection_identity():
     from rdkit import Chem
 
     module = builder
@@ -790,11 +754,6 @@ def test_native_selection_identity(monkeypatch):
             return Chem.Mol(self._mol)
 
     molecule = mol_from_xyz(_PD_COMPLEX)
-    monkeypatch.setattr(
-        module,
-        "rxembed",
-        SimpleNamespace(Conformers=Native, EnsembleSet=module.rxembed.EnsembleSet),
-    )
     with pytest.raises(ValueError, match="unrelaxed"):
         module.selected_endpoint(Native(molecule, [0], [0]))
     with pytest.raises(ValueError, match="exactly one"):
@@ -849,32 +808,26 @@ def test_metal_hydrogens_precede_selection(monkeypatch):
 
     graph = Chem.MolFromSmiles("[NH3]->[Pd+2]<-[Cl-]")
     graph = with_conformer(graph, np.array([[2.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 2.3, 0.0]]))
-    iso = SimpleNamespace(centres=(SimpleNamespace(atom=1),))
+    species = Chem.Mol(graph)
     seen = []
 
     class Choices(list):
         def select(self, **kwargs):
-            return iso
+            return species
 
-    class Isomer:
-        pass
-
-    class Native:
-        pass
-
-    def metal(placed, geometry, **kwargs):
-        assert kwargs == {"center": None, "observed_only": True}
+    def isomers(placed, **kwargs):
+        assert kwargs == {"geometry": "SPL", "center": None, "observed": True}
         coords = placed.GetConformer().GetPositions()
         np.testing.assert_array_equal(coords[:3], graph.GetConformer().GetPositions())
         assert placed.GetNumAtoms() == 6
         assert np.all(np.linalg.norm(coords[3:], axis=1) > 0)
         seen.append(placed)
-        return Choices([iso])
+        return Choices([species])
 
-    fake = SimpleNamespace(Isomer=Isomer, Conformers=Native, metal=metal, IsomerSet=Choices)
+    fake = SimpleNamespace(isomers=isomers, identity=lambda mol: SimpleNamespace(centres=(SimpleNamespace(atom=1),)))
     monkeypatch.setattr(module, "rxembed", fake)
     state, _, requested = module.select_metal_state(graph, "SPL")
-    assert state is iso
+    assert state is species
     assert requested
     assert len(seen) == 1
     assert graph.GetNumAtoms() == 3
@@ -883,16 +836,18 @@ def test_metal_hydrogens_precede_selection(monkeypatch):
 def test_cx_identity_precedes_embedding():
     import rxembed as rx
 
-    selected = rx.metal(_PD_SMILES, "SPL").select(index=0)
+    selected = rx.isomers(_PD_SMILES, geometry="SPL").select(index=0)
     cx = rx.cxsmiles(selected)
     restored, graph, requested = select_metal_state([cx])
     assert requested
     assert graph.GetNumConformers() == 0
-    assert restored.geometry == selected.geometry
+    assert rx.identity(restored).centres[0].geometry == rx.identity(selected).centres[0].geometry
     assert rx.cxsmiles(restored) == cx
     with pytest.raises(ValueError, match="2 isomers fit"):
         select_metal_state("[Cl-]->[Pd+2](<-[Cl-])(<-[NH3])<-[NH3]", "SPL")
-    placed = rx.Conformers(selected.mol, [], iso=selected)
+    placed = Chem.Mol(selected)
+    placed.AddConformer(Chem.Conformer(placed.GetNumAtoms()), assignId=True)
+    placed.AddConformer(placed.GetConformer(), assignId=True)
     with pytest.raises(ValueError, match="exactly one"):
         select_metal_state(placed, "SPL")
 
@@ -902,31 +857,29 @@ def test_native_stereo_and_coordinates():
 
     mol = as_molecules("C[C@H](F)Cl")[0]
     mol.AddConformer(mol.GetConformer(), assignId=True)
-    native = rx.Conformers(mol, [0, 1])
+    native = rx.minimize(mol)
     with pytest.raises(ValueError, match="exactly one selected conformer"):
         selected_endpoint(native)
-    with pytest.raises(ValueError, match="multiple chemical states"):
-        selected_endpoint(rx.EnsembleSet())
     selected = native[1]
     endpoint = selected_endpoint(selected)
     assert endpoint.GetBoolProp(PLACED)
     assert not selected.mol.HasProp(PLACED)
     assert endpoint.GetNumConformers() == 1
     assert [a.GetChiralTag() for a in endpoint.GetAtoms()] == [a.GetChiralTag() for a in mol.GetAtoms()]
-    np.testing.assert_array_equal(endpoint.GetConformer().GetPositions(), mol.GetConformer(1).GetPositions())
+    np.testing.assert_array_equal(endpoint.GetConformer().GetPositions(), selected.mol.GetConformer().GetPositions())
     broken = selected.mol
     broken.GetConformer().SetAtomPosition(0, [np.nan, 0, 0])
     with pytest.raises(ValueError, match="nonfinite"):
-        selected_endpoint(rx.Conformers(broken, [1]))
+        selected_endpoint(SimpleNamespace(ids=[1], unrelaxed=[], mol=broken))
     with pytest.raises(ValueError, match="nonfinite"):
         selected_endpoint(broken)
 
-    stated = rx.metal(_PD_SMILES, "SPL")[0]
-    restored = rx.metal(rx.cxsmiles(stated))[0]
-    assert restored.geometry == stated.geometry
-    metal = rx.embed(restored, n=1, seed=1, threads=1)[0]
+    stated = rx.isomers(_PD_SMILES, geometry="SPL")[0]
+    restored = rx.isomers(rx.cxsmiles(stated))[0]
+    assert rx.identity(restored).centres[0].geometry == rx.identity(stated).centres[0].geometry
+    metal = rx.embed(restored, n=1, seed=1, threads=1)
     placed = selected_endpoint(metal)
-    assert metal.iso is restored
+    assert rx.cxsmiles(placed) == rx.cxsmiles(restored)
     assert placed.GetBoolProp(PLACED)
     assert [a.GetAtomicNum() for a in placed.GetAtoms()] == [a.GetAtomicNum() for a in metal.mol.GetAtoms()]
 
@@ -937,8 +890,8 @@ def test_prepare_preserves_native_endpoint(monkeypatch):
 
     from rxts.utils import with_conformer
 
-    states = rx.metal("N->[Pt+2](<-[Cl-])(<-[Cl-])<-N", "square_planar", screen=False)
-    coordinates = np.array(
+    states = rx.isomers("N->[Pt+2](<-[Cl-])(<-[Cl-])<-N", geometry="square_planar")
+    trans = np.array(
         [
             [2.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
@@ -953,18 +906,18 @@ def test_prepare_preserves_native_endpoint(monkeypatch):
             [-1.4, 0.0, -0.8],
         ]
     )
+    cis = trans.copy()  # the second ammine (atom 4, hydrogens 8-10) and a chloride (atom 2) trade sites
+    cis[[2, 4]] = trans[[4, 2]]
+    cis[8:] = trans[8:] @ np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
 
-    def endpoint(label, shift):
-        iso = states.select(label=label)
-        mol = Chem.Mol(iso.mol)
+    def endpoint(label, positions):
+        mol = Chem.Mol(states.select(label=label))
         for index, atom in enumerate(mol.GetAtoms()):
             atom.SetAtomMapNum(index + 1)
-        positions = coordinates + shift
-        iso.mol = with_conformer(mol, positions)
-        return rx.Conformers(iso.mol, [0], iso=iso), iso, positions
+        return with_conformer(mol, positions), positions
 
-    reactant, reactant_state, reactant_positions = endpoint("cis", np.zeros(3))
-    product, product_state, product_positions = endpoint("trans", np.array([1.0, 2.0, 3.0]))
+    reactant, reactant_positions = endpoint("cis", cis)
+    product, product_positions = endpoint("trans", trans + np.array([1.0, 2.0, 3.0]))
 
     def forbidden(*args, **kwargs):
         pytest.fail("placed endpoint builder reconstructed or evaluated the endpoint")
@@ -981,18 +934,18 @@ def test_prepare_preserves_native_endpoint(monkeypatch):
     ):
         monkeypatch.setattr(owner, name, forbidden)
 
-    mapping = list(range(reactant.mol.GetNumAtoms()))
+    mapping = list(range(reactant.GetNumAtoms()))
     prepared = prepare_endpoints(reactant, product, mapping=mapping, charge=0, multiplicity=1, n_cores=1)
 
     assert prepared.mapping == mapping
     assert prepared.endpoint_identity == (
-        builder._metal_identity(reactant_state),
-        builder._metal_identity(product_state, mapping),
+        builder._metal_identity(reactant),
+        builder._metal_identity(product, mapping),
     )
-    assert prepared.native_states == (reactant_state, product_state)
+    assert [rx.identity(state) for state in prepared.native_states] == [rx.identity(reactant), rx.identity(product)]
     for reached, source, positions in (
-        (prepared.reactant, reactant.mol, reactant_positions),
-        (prepared.product, product.mol, product_positions),
+        (prepared.reactant, reactant, reactant_positions),
+        (prepared.product, product, product_positions),
     ):
         np.testing.assert_array_equal(reached.GetConformer().GetPositions(), positions)
         assert [atom.GetAtomMapNum() for atom in reached.GetAtoms()] == [
@@ -1114,18 +1067,16 @@ def test_coembed_keeps_the_selected_metal_state(monkeypatch):
 
 
 def test_selected_isomers_are_coembedded(monkeypatch):
-    """User-selected, unmapped Isomers co-embed in rxts's order and keep their selected states."""
+    """User-selected, unmapped species co-embed in rxts's order and keep their selected states."""
     rx = builder.rxembed
     _forbid(monkeypatch, "relax_metal_endpoint")
-    isomers = [rx.metal(Chem.AddHs(rx.parse_smiles(s, remove_hs=False))).select() for s in (_BETA_R, _BETA_P)]
+    isomers = [rx.isomers(Chem.AddHs(rx.parse_smiles(s, remove_hs=False))).select() for s in (_BETA_R, _BETA_P)]
     prepared = prepare_endpoints(*isomers, multiplicity=1)
-    assert [a.GetSymbol() for a in prepared.reactant.GetAtoms()] == [
-        a.GetSymbol() for a in isomers[0].restore().GetAtoms()
-    ]
+    assert [a.GetSymbol() for a in prepared.reactant.GetAtoms()] == [a.GetSymbol() for a in isomers[0].GetAtoms()]
     assert [a.GetSymbol() for a in prepared.product.GetAtoms()] == [a.GetSymbol() for a in prepared.reactant.GetAtoms()]
     sym = [a.GetSymbol() for a in prepared.reactant.GetAtoms()]
     assert sorted(sorted((sym[i], sym[j])) for i, j in prepared.forming_bonds) == [["C", "Pd"], ["H", "Pd"]]
     assert [sorted((sym[i], sym[j])) for i, j in prepared.breaking_bonds] == [["C", "H"]]
-    own = [a.GetAtomMapNum() for a in isomers[0].restore().GetAtoms()]  # the caller's maps, not the pinning ones
+    own = [a.GetAtomMapNum() for a in isomers[0].GetAtoms()]  # the caller's maps, not the pinning ones
     assert [a.GetAtomMapNum() for a in prepared.reactant.GetAtoms()] == own
     assert [a.GetAtomMapNum() for a in prepared.product.GetAtoms()] == own

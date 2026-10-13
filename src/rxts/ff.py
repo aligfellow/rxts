@@ -55,8 +55,6 @@ if TYPE_CHECKING:  # annotations only
     from collections.abc import Sequence
     from pathlib import Path
 
-    from rxembed.core import Conformers, Isomer
-
 logger = logging.getLogger(__name__)
 
 _package_logger = logging.getLogger("rxts")
@@ -188,8 +186,8 @@ class TransitionStateGuesser:
     # Affinity-aware budget for independent scoring and rxembed workers.
     n_cores: int | None = None
 
-    _reactant_isomer: Isomer | None = field(default=None, init=False, repr=False)
-    _product_isomer: Isomer | None = field(default=None, init=False, repr=False)
+    _reactant_isomer: Chem.Mol | None = field(default=None, init=False, repr=False)
+    _product_isomer: Chem.Mol | None = field(default=None, init=False, repr=False)
     _product_mapping: list[int] | None = field(default=None, init=False, repr=False)
     _sampling_failures: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
     _conformer_selections: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
@@ -252,8 +250,8 @@ class TransitionStateGuesser:
 
     def prepare_endpoints(
         self,
-        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | Conformers | Isomer,
-        product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | Conformers | Isomer | None = None,
+        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol],
+        product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | None = None,
     ) -> PreparedReaction:
         return _prepare_endpoints(
             reactant,
@@ -272,8 +270,8 @@ class TransitionStateGuesser:
 
     def find_transition_state(
         self,
-        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | Conformers | Isomer | PreparedReaction,
-        product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | Conformers | Isomer | None = None,
+        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | PreparedReaction,
+        product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | None = None,
     ) -> ReactionPath:
         """Build an FF path; optionally score peak candidates on a physical calculator."""
         if self.embed_score is not None and (self.n_embed < 1 or not self.peak_anchored):
@@ -877,48 +875,22 @@ def metal_core(mol, x, targets):
 def embed_candidates(mol, x, targets, n, *, n_cores=None, seed=0xF00D, isomer=None):
     """Propose conformers with held organic distances or a fixed metal core.
 
-    A supplied isomer gives raw distance-geometry seeds; the reaction FF relaxes them before ranking.
+    A selected metal species supplies the coordination state; the TS coordinates own its rigid core.
     """
     if n <= 0 or not targets:
         return []
 
     fixed = metal_core(mol, x, targets)
+    fix = fixed or {
+        pair: (distance - _ORGANIC_DISTANCE_PAD, distance + _ORGANIC_DISTANCE_PAD) for pair, distance in targets.items()
+    }
+    source = with_conformer(mol if isomer is None else isomer, x)
     threads = _worker_count(int(n), n_cores)
-    options: dict[str, Any]
-    if isomer is not None and fixed:
-        # TS coordinates own the rigid core; the saved state supplies its coordination model.
-        source = rxembed.Isomer.from_state(
-            with_conformer(isomer.mol, x),
-            isomer.centres,
-            isomer.donor_bonds,
-            constraints=isomer.base_cons,
-            constrained_metals=isomer.constrained_metals,
-            lengths=isomer.lengths,
-            protect_arrangement=False,
-        )
-        embed = rxembed.core.embed
-        options = {"fix": fixed, "seed": seed, "threads": threads}
-    else:
-        source = set_positions(mol, x)
-        embed = rxembed.embed
-        options = (
-            {"fix": fixed}
-            if fixed
-            else {
-                "fix": {
-                    pair: (distance - _ORGANIC_DISTANCE_PAD, distance + _ORGANIC_DISTANCE_PAD)
-                    for pair, distance in targets.items()
-                }
-            }
-        )
-        options["charge"] = Chem.GetFormalCharge(mol)
-        options.update(seed=seed, threads=threads)
-
     try:
         logger.debug(
             "  re-embedding %d targets with %s.", len(targets), "a rigid core" if fixed else "distance windows"
         )
-        ensemble = embed(source, **options, n=int(n))
+        ensemble = rxembed.embed(source, fix=fix, n=int(n), seed=seed, threads=threads)
         placed = ensemble.mol  # a fresh copy on every access, so bind it once
         return [np.asarray(placed.GetConformer(i).GetPositions()) for i in ensemble.ids]
     except Exception as exc:

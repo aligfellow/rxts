@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import warnings
-from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -49,7 +48,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ase import Atoms
-    from rxembed import Conformers, Isomer
 
 _FRAGMENT_GAP = 2.0  # A of empty space between fragments before they are pulled in
 _CONTACT_SLACK = 0.5  # A beyond the vdW minimum still counts as "touching" (VeloxChem's value)
@@ -64,11 +62,7 @@ logger = logging.getLogger(__name__)
 
 
 def _native_conformer(result, expected=None):
-    """Validate and return one relaxed native conformer."""
-    if isinstance(result, rxembed.EnsembleSet):
-        raise ValueError("rxembed found multiple chemical states; select one native isomer and conformer first")
-    if not isinstance(result, rxembed.Conformers):
-        raise TypeError("Select one rxembed isomer and conformer before preparing the reaction")
+    """Validate and return the one relaxed conformer of an rxembed result."""
     if len(result.ids) != 1:
         raise ValueError("rxembed must return exactly one selected conformer")
     if result.unrelaxed:
@@ -378,9 +372,9 @@ def derive_product_geometry(reactant, product, forming, breaking):
     )
 
 
-def _metal_identity(isomer, product_mapping=None):
-    """Copy selected rxembed coordination identity into JSON-safe atom-index data."""
-    if isomer is None:
+def _metal_identity(species, product_mapping=None):
+    """Copy a selected rxembed species' coordination identity into JSON-safe atom-index data."""
+    if species is None:
         return None
 
     def indices(values):
@@ -392,7 +386,7 @@ def _metal_identity(isomer, product_mapping=None):
         return [int(product_mapping[i]) for i in values]
 
     centres = []
-    for state in isomer.centres:
+    for state in rxembed.identity(species).centres:
         vertices = []
         for site in state.vertices:
             if site is None:
@@ -420,7 +414,7 @@ def _metal_identity(isomer, product_mapping=None):
 class PreparedReaction:
     """Mapped endpoints in reactant atom order, ready for FF interpolation.
 
-    Native sources and isomers retain their original index spaces and selected identities."""
+    Native sources and selected species retain their original index spaces and identities."""
 
     reactant: Chem.Mol
     product: Chem.Mol
@@ -432,7 +426,7 @@ class PreparedReaction:
     solvent: str | None
     n_cores: int | None
     sources: tuple[object, object] = field(repr=False)
-    native_states: tuple[Isomer | None, Isomer | None] = field(default=(None, None), repr=False)
+    native_states: tuple[Chem.Mol | None, Chem.Mol | None] = field(default=(None, None), repr=False)
     endpoint_identity: tuple[dict | None, dict | None] = (None, None)
 
     @property
@@ -473,7 +467,7 @@ def _check_same_atoms(rea, pro):
 
 
 def _declared_endpoint(spec, charge=None):
-    """Read topology and declared charge before embedding; native Isomers restore real metals."""
+    """Read topology and declared charge before embedding."""
     if _is_xyz_input(spec):
         mol = Chem.Mol(spec) if isinstance(spec, Chem.Mol) else mol_from_xyz(spec, charge=charge)
         return None, mol
@@ -489,10 +483,7 @@ def _declared_endpoint(spec, charge=None):
     elif isinstance(spec, (str, Path)):
         mols = [parse_smiles(spec)]
     else:
-        mol = spec.restore() if isinstance(spec, rxembed.Isomer) else getattr(spec, "mol", None)
-        if not isinstance(mol, Chem.Mol):
-            raise TypeError("Expected reaction SMILES, RDKit molecules, XYZ files, or selected rxembed states")
-        mols = [mol]
+        raise TypeError("Expected reaction SMILES, RDKit molecules or XYZ files")
     charge = sum(atom.GetFormalCharge() for mol in mols for atom in mol.GetAtoms())
     graph = Chem.Mol(mols[0])
     for fragment in mols[1:]:
@@ -536,9 +527,11 @@ def selected_endpoint(spec, expected=None):
 
 
 def select_metal_state(spec, geometry=None):
-    """Select a native metal arrangement; geometry names select a shape only.
+    """Select one native metal species; geometry names select a shape only.
 
-    CX labels and Isomer inputs retain their source indexing; placed conformers keep their coordinates.
+    Return ``(species, endpoint, requested)``. A metal Mol whose conformer states its arrangement in atom notes,
+    such as an rxembed result's ``.mol``, is placed: its coordinates are kept. Any other metal input is read by
+    `rxembed.isomers` and must be one species. CX labels and selected species retain their source indexing.
     """
     original = spec
     if isinstance(spec, (list, tuple)) and all(isinstance(part, str) for part in spec):
@@ -546,73 +539,53 @@ def select_metal_state(spec, geometry=None):
     graph = spec
     if isinstance(spec, str) and not _is_xyz_input(spec):
         graph = Chem.MolFromSmiles(spec)
-    if isinstance(graph, Chem.Mol):
-        if not metal_atoms(graph):
-            if geometry is not None:
-                raise ValueError("Endpoint geometry requires a metal coordination state")
-            return None, original, False
-        if geometry is None and graph.HasProp(PLACED):
-            return None, original, False
-    elif isinstance(spec, (str, Path, list, tuple)):
+    if not isinstance(graph, Chem.Mol):
         if isinstance(spec, (list, tuple)) and any(isinstance(part, Chem.Mol) and metal_atoms(part) for part in spec):
-            raise ValueError("Native metal preparation requires one combined molecule or selected native Isomer")
+            raise ValueError("Native metal preparation requires one combined molecule or selected species")
         if geometry is not None:
-            raise ValueError("Endpoint geometry requires one metal molecule or native Isomer")
+            raise ValueError("Endpoint geometry requires one metal molecule or selected species")
+        return None, original, False
+    if not metal_atoms(graph):
+        if geometry is not None:
+            raise ValueError("Endpoint geometry requires a metal coordination state")
+        return None, original, False
+    if geometry is None and graph.HasProp(PLACED):
         return None, original, False
 
-    if isinstance(spec, rxembed.Conformers):
-        graph = selected_endpoint(spec)
-        iso = spec.iso
-        if iso is None and geometry is not None:
-            raise ValueError("Endpoint geometry requires a selected native metal Isomer")
-        if geometry is None:
-            return iso, graph, False
-    elif isinstance(spec, rxembed.Isomer):
-        iso = spec
-        if iso.mol.GetNumConformers() > 1:
-            raise ValueError("Select exactly one native Isomer conformer before preparing the reaction")
-        graph = rxembed.Conformers(iso.mol, [c.GetId() for c in iso.mol.GetConformers()], iso=iso).mol
-    elif isinstance(graph, Chem.Mol):
-        # Native parsing binds donor notes to their bonds before AddHs appends atoms. RDKit's
-        # ordinary parser loses coordinated ligand tags, so it is used only for metal detection.
-        if isinstance(spec, str):
-            graph = rxembed.parse_smiles(spec, remove_hs=False)
-        graph = Chem.AddHs(graph, addCoords=bool(graph.GetNumConformers()))
-        if geometry is None and not graph.GetNumConformers():
-            metals = metal_atoms(graph)
-            if not all(graph.GetAtomWithIdx(m).HasProp("atomNote") for m in metals):
-                raise ValueError("Coordinate-free metal endpoints need geometry= or selected native CX/Isomer state")
-        isomers = rxembed.metal(
-            graph,
-            geometry,
-            center="all" if len(metal_atoms(graph)) > 1 else None,
-            observed_only=bool(graph.GetNumConformers()),
-        )
-        if len(isomers) > 1:
-            labels = ", ".join(iso.label or f"#{k}" for k, iso in enumerate(isomers))
-            raise ValueError(f"{len(isomers)} isomers fit ({labels}); pass one from rxembed.metal(...).select(...)")
-        iso = isomers.select()
-    else:
-        raise TypeError("Select one rxembed isomer and conformer before preparing the reaction")
-
+    # Native parsing binds donor notes to their bonds before AddHs appends atoms. RDKit's
+    # ordinary parser loses coordinated ligand tags, so it is used only for metal detection.
+    if isinstance(spec, str):
+        graph = rxembed.parse_smiles(spec, remove_hs=False)
+    if graph.GetNumConformers() > 1:
+        raise ValueError("Select exactly one conformer of a metal endpoint before preparing the reaction")
+    observed = graph.GetNumConformers() == 1
+    graph = Chem.AddHs(graph, addCoords=observed)
+    metals = metal_atoms(graph)
+    stated = all(graph.GetAtomWithIdx(m).HasProp("atomNote") for m in metals)
+    if geometry is None and not (stated or observed):
+        raise ValueError("Coordinate-free metal endpoints need geometry= or a selected species or CX state")
+    found = rxembed.isomers(graph, geometry=geometry, center="all" if len(metals) > 1 else None, observed=observed)
+    if len(found) > 1:
+        labels = ", ".join(rxembed.identity(state).label or f"#{k}" for k, state in enumerate(found))
+        raise ValueError(f"{len(found)} isomers fit ({labels}); pass one from rxembed.isomers(...).select(...)")
+    species = found.select()
     if geometry is not None:
-        for state in iso.centres:
-            rxembed.IsomerSet([iso]).select(geometry=geometry, center=state.atom)
-    return iso, graph, True
+        for state in rxembed.identity(species).centres:
+            found.select(geometry=geometry, center=state.atom)
+    if observed and stated and geometry is None:
+        graph = selected_endpoint(graph)
+        graph.SetBoolProp(PLACED, True)
+        return species, graph, False
+    return species, graph, True
 
 
-def relax_metal_endpoint(isomer, reactant, mapping):
-    """Relax a copied native isomer from the mapped endpoint seed.
-
-    rxembed restores real elements, charges and donor bonds; source identity stays unchanged."""
-    seeded = deepcopy(isomer)
+def relax_metal_endpoint(species, reactant, mapping):
+    """Relax a native species from the mapped endpoint seed; the caller's species is unchanged."""
     reference = reactant.GetConformer().GetPositions()[mapping]
     if not np.isfinite(reference).all():
         raise ValueError("The native endpoint seed has nonfinite coordinates")
-    seeded.mol = with_conformer(seeded.mol, reference)
-    expected = rxembed.Conformers(seeded.mol, [0], iso=seeded).mol
-    result = rxembed.minimize(seeded)
-    product = selected_endpoint(result, expected)
+    seeded = with_conformer(species, reference)
+    product = selected_endpoint(rxembed.minimize(seeded), seeded)
     if [a.GetAtomicNum() for a in product.GetAtoms()] != [
         reactant.GetAtomWithIdx(int(r)).GetAtomicNum() for r in mapping
     ]:
@@ -629,39 +602,35 @@ def _graph_only(spec):
     return isinstance(spec, Chem.Mol) and not spec.GetNumConformers()
 
 
-def _mapped(side, maps):
-    """Return a copy of a selected state or graph whose atom maps pin rxts's mapping."""
-    side = deepcopy(side)
-    mols = (side.mol, side.graph) if isinstance(side, rxembed.Isomer) else (side,)
-    for mol in mols:
-        Chem.GetSymmSSSR(mol)  # combined fragments carry no ring info
-        for atom, number in zip(mol.GetAtoms(), maps, strict=True):
-            atom.SetAtomMapNum(number)
-    return side
+def _mapped(mol, maps):
+    """Return a copy of an endpoint species or graph whose atom maps pin rxts's mapping."""
+    out = Chem.Mol(mol)
+    Chem.GetSymmSSSR(out)  # combined fragments carry no ring info
+    for atom, number in zip(out.GetAtoms(), maps, strict=True):
+        atom.SetAtomMapNum(number)
+    return out
 
 
-def _coembed_endpoints(sides, mapping, charge, seed):
+def _coembed_endpoints(sides, mapping, seed):
     """Embed both endpoints as one tied rxembed system and return them in the reactant's atom order.
 
-    `sides` are each endpoint's selected state, or its graph when it has no metal, in its own atom order. Atom
+    `sides` are each endpoint's selected species, or its graph when it has no metal, in its own atom order. Atom
     maps carry rxts's mapping through rxembed (reactant atom r is r + 1; product atom p is mapping[p] + 1), and
     every returned atom keeps its map, so ordering by map restores the reactant's order.
     """
     n = len(mapping)
     sides = (_mapped(sides[0], range(1, n + 1)), _mapped(sides[1], [r + 1 for r in mapping]))
-    left, right = rxembed.coembed(sides, charge=charge, n=1, seed=seed, threads=1)
-    cid = int(left.ids[0])
     paired = []
-    for ensemble in (left, right):
-        order = sorted(range(n), key=lambda i: ensemble.mol.GetAtomWithIdx(i).GetAtomMapNum())
-        mol = selected_endpoint(rxembed.Conformers(Chem.Mol(ensemble.mol, confId=cid), [cid], iso=ensemble.iso))
+    for ensemble in rxembed.coembed(sides, n=1, seed=seed, threads=1):
+        mol = selected_endpoint(ensemble)
+        order = sorted(range(n), key=lambda i: mol.GetAtomWithIdx(i).GetAtomMapNum())
         paired.append(Chem.RenumberAtoms(mol, order))
     return paired
 
 
 def prepare_endpoints(
-    reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | Conformers | Isomer,
-    product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | Conformers | Isomer | None = None,
+    reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol],
+    product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | None = None,
     *,
     seed: int = 0xF00D,
     forming_bonds: list[tuple[int, int]] | None = None,
@@ -676,9 +645,9 @@ def prepare_endpoints(
 ) -> PreparedReaction:
     """Map endpoints and prepare matching graphs and coordinates without scanning or QM.
 
-    Endpoints without coordinates, including selected rxembed Isomers, are embedded together as one tied rxembed
-    system in the reactant's atom order. Placed conformers retain their coordinates, and native source objects
-    keep their original atom order.
+    Endpoints without coordinates, including selected rxembed species, are embedded together as one tied rxembed
+    system in the reactant's atom order. Placed conformers retain their coordinates, and native sources keep their
+    original atom order.
     """
     _validate_declared_context(charge, multiplicity)
     if multiplicity is None:
@@ -731,7 +700,7 @@ def prepare_endpoints(
             graph if state is None else state
             for state, graph in ((rea_state, reactant_graph), (pro_state, product_graph))
         )
-        paired = _coembed_endpoints(sides, mapping, charge, seed)
+        paired = _coembed_endpoints(sides, mapping, seed)
         for mol in paired:  # the caller's own maps, in the reactant's order
             for atom, source in zip(mol.GetAtoms(), reactant_graph.GetAtoms(), strict=True):
                 atom.SetAtomMapNum(source.GetAtomMapNum())
@@ -741,7 +710,7 @@ def prepare_endpoints(
         if rea_state is None or pro_state is None:
             raise ValueError("Native paired preparation requires a selected coordination state at both endpoints")
         if not reactant.GetNumConformers():
-            reactant = selected_endpoint(rxembed.embed(deepcopy(rea_state), n=1, seed=seed, threads=1), reactant)
+            reactant = selected_endpoint(rxembed.embed(rea_state, n=1, seed=seed, threads=1), reactant)
         elif rea_request:
             reactant = relax_metal_endpoint(rea_state, reactant, list(range(reactant.GetNumAtoms())))
         else:

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from numbers import Real
 
 import numpy as np
+import rxembed
 from rdkit import Chem
 from rdkit.Chem import rdForceFieldHelpers, rdMolTransforms
 
@@ -158,7 +159,7 @@ def driving_restraint(x, lam, bond, contact):
     return e_total, g
 
 
-def _endpoint_metal_angles(mol, isomer=None, mapping=None):
+def _endpoint_metal_angles(mol, species=None, mapping=None):
     """Build metal-centred angle references in `mol`'s atom order from its geometry."""
 
     def mapped(i):
@@ -167,9 +168,10 @@ def _endpoint_metal_angles(mol, isomer=None, mapping=None):
 
     centres = []
     source = "endpoint_graph"
-    if isomer is not None and isomer.centres:
+    states = () if species is None else rxembed.identity(species).centres
+    if states:
         source = "native_state"
-        for state in isomer.centres:
+        for state in states:
             sites = []
             for site in state.vertices:
                 if site is None:
