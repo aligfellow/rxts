@@ -54,6 +54,23 @@ Cl  0.000 -2.300  0.000
         guesser._build_potential("gfnff", reactant, product, [(0, 1)], [], charge=0)
 
 
+def test_start_conformer_is_chosen_on_the_path(monkeypatch):
+    """The start whose path preview peaks lowest wins, even with the higher reactant energy."""
+    low_reactant, low_path = np.zeros((1, 3)), np.ones((1, 3))
+
+    class Pot:
+        changing = ()
+
+        def energy(self, x, lam):
+            path = float(x[0, 0])  # 0: low reactant, steep path; 1: higher reactant, flat path
+            return ((1 - lam) * path + lam * 10 * (1 - path), None, None)
+
+    guesser = rxts.TransitionStateGuesser(engine="gfnff", multiplicity=1, n_conformers=2)
+    monkeypatch.setattr(ff, "conformers", lambda **kwargs: [low_path])
+    monkeypatch.setattr(guesser, "_minimize", lambda pot, x, lam: x)
+    assert guesser._best_conformer(pot=Pot(), rea=None, x=low_reactant, rng=None) is low_path
+
+
 def test_native_endpoints_are_prepared_once(monkeypatch):
     rx = rxembed
     from rdkit import Chem

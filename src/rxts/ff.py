@@ -675,7 +675,11 @@ class TransitionStateGuesser:
         return bad - {0, len(frames) - 1}
 
     def _best_conformer(self, pot, rea, x, rng):
-        """Resample spectator torsions and keep the lowest-energy reactant structure."""
+        """Resample spectator torsions and keep the reactant structure whose path preview peaks lowest.
+
+        Each candidate is relaxed at lambda=0, then carried through `_PREVIEW` as the scan would; the lowest highest
+        point wins, so the start suits the path rather than the reactant alone.
+        """
         if self.n_conformers <= 1:
             return x
 
@@ -683,19 +687,20 @@ class TransitionStateGuesser:
         if not candidates:
             return x
 
-        best = self._minimize(pot, x, 0.0)
-        best_e = pot.energy(best, 0.0)[0]
-        starting = best_e
-
-        for trial_x in candidates:
-            trial = self._minimize(pot, trial_x, 0.0)
-            e = pot.energy(trial, 0.0)[0]
-            if e < best_e:
-                best, best_e = trial, e
+        best, best_peak, starting = None, np.inf, None
+        for trial_x in (x, *candidates):
+            start = self._minimize(pot, trial_x, 0.0)
+            y, peak = start, -np.inf
+            for lam in _PREVIEW:
+                y = self._minimize(pot, y, lam)
+                peak = max(peak, pot.energy(y, lam)[0])
+            starting = peak if starting is None else starting
+            if peak < best_peak:
+                best, best_peak = start, peak
 
         logger.info(
             f"Conformer search: {len(candidates)} spectator conformer(s); reactive atoms excluded from torsion moves. "
-            f"{starting:.2f} -> {best_e:.2f} kcal/mol"
+            f"Path preview peak {starting:.2f} -> {best_peak:.2f} kcal/mol"
         )
         return best
 
@@ -794,6 +799,9 @@ __all__ = ["ConformerScoringError", "interpolate"]
 
 # Hold reactive distances without holding the attack angle. FF relaxation then settles each proposal.
 _ORGANIC_DISTANCE_PAD = 0.05
+
+# Lambdas a starting conformer is carried through to preview its path (see `_best_conformer`).
+_PREVIEW = (0.25, 0.5, 0.75)
 
 
 def rotatable_torsions(mol, reactive=()):
