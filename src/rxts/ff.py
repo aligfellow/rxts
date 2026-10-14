@@ -885,6 +885,8 @@ def embed_candidates(mol, x, targets, n, *, n_cores=None, seed=0xF00D, isomer=No
         pair: (distance - _ORGANIC_DISTANCE_PAD, distance + _ORGANIC_DISTANCE_PAD) for pair, distance in targets.items()
     }
     source = with_conformer(mol if isomer is None else isomer, x)
+    if fixed:  # the TS frame seats the metal's donors, so the species embedded is the one the frame realises
+        source = rxembed.isomers(source, observed=True)[0]
     threads = _worker_count(int(n), n_cores)
     try:
         logger.debug(

@@ -811,8 +811,7 @@ def test_native_metal_sampling(monkeypatch):
     mol = mol_from_xyz(_PD_COMPLEX)
     x = mol.GetConformer().GetPositions()
     x[1, 0] += 0.1
-    species = Chem.Mol(mol)
-    species.GetAtomWithIdx(0).SetProp("atomNote", "SPL")  # the arrangement the selected species states
+    species = rxembed.isomers(mol)[0]  # the selected species, stating the arrangement the geometry realises
     captured = {}
 
     def embed(source, **kwargs):
