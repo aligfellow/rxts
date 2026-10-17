@@ -298,10 +298,8 @@ def test_metal_guidance_changes_sampling_only():
 
 
 def test_native_haptic_angle_mapping(monkeypatch):
-    class Haptic:
-        atoms = (1, 2)
-
-    state = type("Centre", (), {"atom": 0, "vertices": (Haptic(), 3, None)})()
+    vertices = (SimpleNamespace(atoms=(1, 2)), SimpleNamespace(atoms=(3,)), None)
+    state = type("Centre", (), {"atom": 0, "vertices": vertices})()
     species = object()
 
     def identity(mol):

@@ -174,10 +174,8 @@ def _endpoint_metal_angles(mol, species=None, mapping=None):
         for state in states:
             sites = []
             for site in state.vertices:
-                if site is None:
-                    continue
-                atoms = site.atoms if hasattr(site, "atoms") else (int(site),)
-                sites.append(tuple(mapped(i) for i in atoms))
+                if site is not None:
+                    sites.append(tuple(mapped(i) for i in site.atoms))
             centres.append((mapped(state.atom), sites))
     else:
         metals = metal_atoms(mol)

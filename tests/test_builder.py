@@ -454,7 +454,10 @@ def test_native_metal_identity_uses_mapped_indices():
     assert centre["atom"] == 1
     assert centre["mapped_atom"] == 0
     assert (centre["atomic_number"], centre["charge"], centre["geometry"], centre["hand"]) == (46, 2, "linear", "")
-    assert centre["vertices"] == [{"atom": 0, "mapped_atom": 2}, {"atom": 2, "mapped_atom": 1}]
+    assert centre["vertices"] == [
+        {"atoms": [0], "mapped_atoms": [2], "winding": ""},
+        {"atoms": [2], "mapped_atoms": [1], "winding": ""},
+    ]
 
 
 def test_prepare_validates_spin_and_resources_first(monkeypatch):
