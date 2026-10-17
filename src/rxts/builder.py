@@ -387,15 +387,12 @@ def _metal_identity(species, product_mapping=None):
 
     centres = []
     for state in rxembed.identity(species).centres:
-        vertices = []
-        for site in state.vertices:
-            if site is None:
-                vertices.append(None)
-            elif hasattr(site, "atoms"):
-                atoms = [int(i) for i in site.atoms]
-                vertices.append({"atoms": atoms, "mapped_atoms": indices(atoms), "winding": str(site.winding)})
-            else:
-                vertices.append({"atom": int(site), "mapped_atom": indices([site])[0]})
+        vertices = [
+            None
+            if site is None
+            else {"atoms": [int(i) for i in site.atoms], "mapped_atoms": indices(site.atoms), "winding": site.winding}
+            for site in state.vertices
+        ]
         centres.append(
             {
                 "atom": int(state.atom),
@@ -566,7 +563,9 @@ def select_metal_state(spec, geometry=None):
         raise ValueError("Coordinate-free metal endpoints need geometry= or a selected species or CX state")
     found = rxembed.isomers(graph, geometry=geometry, center="all" if len(metals) > 1 else None, observed=observed)
     if len(found) > 1:
-        labels = ", ".join(rxembed.identity(state).label or f"#{k}" for k, state in enumerate(found))
+        labels = ", ".join(
+            "/".join(filter(None, rxembed.identity(state).labels)) or f"#{k}" for k, state in enumerate(found)
+        )
         raise ValueError(f"{len(found)} isomers fit ({labels}); pass one from rxembed.isomers(...).select(...)")
     species = found.select()
     if geometry is not None:
