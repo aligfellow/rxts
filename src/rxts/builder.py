@@ -619,8 +619,11 @@ def _coembed_endpoints(sides, mapping, seed):
     """
     n = len(mapping)
     sides = (_mapped(sides[0], range(1, n + 1)), _mapped(sides[1], [r + 1 for r in mapping]))
+    pair = rxembed.coembed(sides, n=1, seed=seed, threads=1)
+    if not len(pair):
+        raise ValueError("rxembed co-embedded no pair of these endpoints; check that each side embeds alone")
     paired = []
-    for ensemble in rxembed.coembed(sides, n=1, seed=seed, threads=1):
+    for ensemble in (pair.reactant, pair.product):
         mol = selected_endpoint(ensemble)
         order = sorted(range(n), key=lambda i: mol.GetAtomWithIdx(i).GetAtomMapNum())
         paired.append(Chem.RenumberAtoms(mol, order))
