@@ -1,10 +1,11 @@
-"""Map reaction mechanisms with VeloxChem's assist-id pre-solve and rxts search.
+"""Map reaction mechanisms: anchor the untouched atoms, then search the rest exactly.
 
-VeloxChem's ``ReactionMatcher`` supplies the graph pre-solve (``_calculate_assist_ids``,
-``reactionmatcher.py:346-503``). rxts replaces its incremental breaking-edge search with
-branch-and-bound over bijections (:func:`_optimum`, :func:`_search`), enumerates tied mechanisms,
-and ranks them by the pericyclic array. Naming bonds affects pre-solve pins; it does not constrain
-that search. Mechanism selection among ties happens in the caller.
+:func:`_anchors` pairs atoms whose surroundings are unchanged and unambiguous, as VeloxChem's
+``ReactionMatcher`` assist ids do (``reactionmatcher.py:346-503``) but without its greedy, atom-order
+dependent pick. Branch-and-bound over bijections (:func:`_optimum`, :func:`_search`) maps the rest,
+enumerates tied mechanisms, and ranks them by the pericyclic array. Naming bonds edits the reactant
+the anchors read; it does not constrain that search. Mechanism selection among ties happens in the
+caller.
 
 SMILES parsing, graph mapping and relay construction are independent of endpoint embedding and FF scanning.
 """
@@ -14,27 +15,31 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
+from functools import partial
 from itertools import permutations, product
 from numbers import Integral
 from pathlib import Path
 from typing import Any
 
 import networkx as nx
-from networkx.algorithms.isomorphism import GraphMatcher
+import numpy as np
+import rxembed
 from rdkit import Chem
+from scipy.optimize import linear_sum_assignment
 
 from rxts.utils import describe, is_xyz_file, mol_from_xyz
 
 logger = logging.getLogger(__name__)
 
-# Bounded so a pathological input degrades instead of hanging.
-_MAX_NODES = 2_000_000
-_MAX_OPTIMA = 20_000
+# Search nodes allowed across every pass before the mapper gives up rather than hang. Most
+# reactions need a few hundred; listing ties visits at least one node per tied mapping, so this bounds the
+# tie list too.
+_MAX_NODES = 200_000
 
-# Explicit hydrogens can make symmetry enumeration factorial. Truncation leaves mechanism
-# equivalence unestablished, so report it rather than silently merging or refusing the reaction.
-_MAX_AUTOMORPHISMS = 5000
+# Search depth down to which a node is bounded by an assignment of the atoms left (see `_search`).
+_BOUND_DEPTH = 8
 
 # Ceiling on changing bonds: where `_optimum`'s ladder stops and reports no single step.
 _MAX_CHANGING = 12
@@ -44,6 +49,19 @@ _MAX_ARRAY_BONDS = 6
 
 # Graph-ranking heuristic favours six-atom reaction circuits.
 _HUCKEL_ARRAY = 6
+
+# Pauling electronegativity by atomic number (CRC values); He, Ne, Ar and elements past Lr have none.
+_PAULING = [None] + [
+    None if value == "-" else float(value)
+    for value in """
+    2.20 -    0.98 1.57 2.04 2.55 3.04 3.44 3.98 -    0.93 1.31 1.61 1.90 2.19 2.58 3.16 -    0.82 1.00
+    1.36 1.54 1.63 1.66 1.55 1.83 1.88 1.91 1.90 1.65 1.81 2.01 2.18 2.55 2.96 3.00 0.82 0.95 1.22 1.33
+    1.6  2.16 1.9  2.2  2.28 2.20 1.93 1.69 1.78 1.96 2.05 2.1  2.66 2.6  0.79 0.89 1.10 1.12 1.13 1.14
+    1.13 1.17 1.2  1.2  1.1  1.22 1.23 1.24 1.25 1.1  1.27 1.3  1.5  2.36 1.9  2.2  2.20 2.28 2.54 2.00
+    1.62 2.33 2.02 2.0  2.2  2.2  0.7  0.9  1.1  1.3  1.5  1.38 1.36 1.28 1.3  1.3  1.3  1.3  1.3  1.3
+    1.3  1.3  1.3
+    """.split()
+]
 
 
 _REACTION_PARTS = 3  # reactants > agents > products
@@ -82,12 +100,7 @@ def split_reaction_smiles(reaction):
 
 def parse_smiles(smiles):
     """Parse explicit hydrogens in the shared mapper/embedding atom order."""
-    params = Chem.SmilesParserParams()
-    params.removeHs = False  # Retain mapped transferring protons.
-    mol = Chem.MolFromSmiles(smiles, params)
-    if mol is None:
-        raise ValueError(f"Could not parse SMILES {smiles!r}")
-    return Chem.AddHs(mol)
+    return Chem.AddHs(rxembed.parse_smiles(smiles, remove_hs=False))
 
 
 def _from_smiles(smiles, side):
@@ -157,13 +170,117 @@ def _environment(mol, radius=2):
     """Fingerprint each atom by its local bonding environment out to `radius` bonds (default 2).
 
     Orders mapping candidates so a cheap mapping is found early; never filters, since an atom near the
-    reaction legitimately differs between the two sides. Not the assist ids, which pin one atom to one
-    atom where the neighbourhoods are provably isomorphic; ordering never fixes an atom.
+    reaction legitimately differs between the two sides. Not the anchors, which fix an atom whose
+    whole neighbourhood is unchanged and unambiguous; ordering never fixes an atom.
     """
     env = [(a.GetAtomicNum(),) for a in mol.GetAtoms()]
     for _ in range(radius):
         env = [env[a.GetIdx()] + tuple(sorted(env[n.GetIdx()] for n in a.GetNeighbors())) for a in mol.GetAtoms()]
     return env
+
+
+def _orbits(mol, adjacency, atoms, fixed, hydrogens=None):
+    """A stabiliser chain of the symmetries of `mol` on `atoms` that leave every `fixed` atom in place.
+
+    Takes `atoms` in order. Each one some remaining symmetry moves is yielded with one symmetry carrying it
+    to each other atom of its orbit, then held fixed, so later orbits are those of the symmetries left:
+    two H on a CH2, the methyls of an iPr, two AcOH, and the two faces of every free phenyl. RDKit's
+    untied canonical ranks propose an orbit; equal canonical SMILES rooted at two atoms prove it, and their
+    output orders give the symmetry.
+    """
+    skeleton = _skeleton(mol, adjacency, hydrogens)
+    labels = skeleton[0]
+    for k, a in enumerate(fixed, 1):
+        labels.GetAtomWithIdx(a).SetAtomMapNum(k)
+    held = len(fixed)
+    ranks = Chem.CanonicalRankAtoms(labels, breakTies=False)
+    for x in atoms:
+        alike = [y for y in atoms if y != x and ranks[y] == ranks[x]]
+        if not alike:
+            continue
+        key, start = _canonical(skeleton, atoms, x)
+        symmetries = []
+        for y in alike:
+            other, image = _canonical(skeleton, atoms, y)
+            if other == key:
+                symmetries.append(dict(zip(start, image, strict=True)))
+        yield x, symmetries
+        held += 1
+        labels.GetAtomWithIdx(x).SetAtomMapNum(held)
+        ranks = Chem.CanonicalRankAtoms(labels, breakTies=False)
+
+
+def _symmetry(pro, pro_adj, rea, rea_adj, candidates, order, pro_hydrogens=None, rea_hydrogens=None):
+    """Lex-leader constraints that search one mapping of every family related by symmetry.
+
+    A symmetry of the product leaves every bond as it was, and one of the reactant gives the same mechanism
+    relabelled, so of each family only the mapping first in this order is needed: atoms in search `order`,
+    images compared by reactant index. Along the product's stabiliser chain (see `_orbits`), taken in that
+    order, that mapping gives each atom the smallest image in its orbit (`below`). A reactant symmetry first
+    changes the image of the first product atom placed into an atom it moves, and that atom must take the
+    smaller of its target and the target's image (`entry`). Every constraint keeps the order's first
+    mapping, so all of them together lose nothing.
+    """
+    pinned = [p for p in order if len(candidates[p]) == 1]
+    below = [[] for _ in range(pro.GetNumAtoms())]
+    for x, symmetries in _orbits(pro, pro_adj, order, pinned, pro_hydrogens):
+        for symmetry in symmetries:
+            below[symmetry[x]].append(x)
+    reactant_atoms = sorted({r for p in order for r in candidates[p]})
+    fixed = [candidates[p][0] for p in pinned]
+    moves = [s for _, ss in _orbits(rea, rea_adj, reactant_atoms, fixed, rea_hydrogens) for s in ss]
+    entry = [[] for _ in range(rea.GetNumAtoms())]
+    for k, symmetry in enumerate(moves):
+        for a, b in symmetry.items():
+            if a != b:
+                entry[a].append((k, b))
+    return below, entry, len(moves)
+
+
+def _terminal_hydrogens(mol):
+    """Each atom's hydrogens, or None when any hydrogen is not a plain H on exactly one heavy atom."""
+    found = [[] for _ in range(mol.GetNumAtoms())]
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 1:
+            partners = atom.GetNeighbors()
+            if atom.GetIsotope() or len(partners) != 1 or partners[0].GetAtomicNum() == 1:
+                return None
+            found[partners[0].GetIdx()].append(atom.GetIdx())
+    return found
+
+
+def _with_hydrogens(heavy, rea_h, pro_h):
+    """Complete a mapping of heavy atoms with their hydrogens, once per distinct way the spare ones move.
+
+    A hydrogen stays on its atom where it can; an atom left short takes spare hydrogens from atoms holding
+    more than their partner needs. Hydrogens on one atom are interchangeable, so ways differ only in how
+    many each donor gives each short atom, and a short atom's slots take donors in order.
+    """
+    full, spare, short = list(heavy), {}, []
+    for p, r in enumerate(heavy):
+        if r is not None:
+            kept = min(len(rea_h[r]), len(pro_h[p]))
+            for a, b in zip(rea_h[r][:kept], pro_h[p][:kept], strict=True):
+                full[b] = a
+            if len(rea_h[r]) > kept:
+                spare[r] = rea_h[r][kept:]
+            short += [(p, h) for h in pro_h[p][kept:]]
+    donors, given = sorted(spare), dict.fromkeys(spare, 0)
+
+    def fill(k, start):
+        if k == len(short):
+            yield list(full)
+            return
+        p, h = short[k]
+        first = start if k and short[k - 1][0] == p else 0
+        for i, r in enumerate(donors[first:], first):
+            if given[r] < len(spare[r]):
+                full[h] = spare[r][given[r]]
+                given[r] += 1
+                yield from fill(k + 1, i)
+                given[r] -= 1
+
+    return fill(0, 0)
 
 
 def map_reaction(
@@ -174,9 +291,9 @@ def map_reaction(
 ) -> tuple[Mechanism, list[Mechanism]]:
     """Return the best product-to-reactant mapping and all tied mechanisms.
 
-    Named bonds use reactant indices and reach the VeloxChem assist-id pre-solve only, following
-    `get_mapping` and `_prepare_graph` in reactionmatcher.py. They guide the initial atom pins;
-    the branch-and-bound search still minimises bond changes.
+    Named bonds use reactant indices and edit the reactant the anchors read, following `get_mapping`
+    and `_prepare_graph` in reactionmatcher.py. They guide the anchors; the branch-and-bound search
+    still minimises bond changes.
 
     More than one tied mechanism means connectivity alone leaves an ambiguity. Callers can select
     among ties or provide atom-mapped SMILES.
@@ -217,77 +334,202 @@ def map_reaction(
         for p in range(n)
     ]
 
-    # Pin the atoms the search need not guess, each as a one-element candidate list. Explicit maps
-    # override assist ids, including dependent hydrogen assignments: keeping a hydrogen paired to the
-    # parent an overridden assist pin chose creates a hybrid mapping that respects neither pin set.
-    explicit_pro = {r: p for p, r in pins.items()}
-    for p, r in _assist_pins(rea, pro, breaking_bonds, forming_bonds).items():
-        if rea_identity[r] != pro_identity[p]:
-            continue
-        if (p in pins and pins[p] != r) or (r in explicit_pro and explicit_pro[r] != p):
-            continue
-        if pro.GetAtomWithIdx(p).GetAtomicNum() == 1:
-            pro_parent = next((n.GetIdx() for n in pro.GetAtomWithIdx(p).GetNeighbors() if n.GetAtomicNum() != 1), None)
-            rea_parent = next((n.GetIdx() for n in rea.GetAtomWithIdx(r).GetNeighbors() if n.GetAtomicNum() != 1), None)
-            if (
-                pro_parent is not None
-                and rea_parent is not None
-                and pro_identity[pro_parent] != rea_identity[rea_parent]
-            ):
-                continue
-            if (pro_parent is not None and pro_parent in pins and pins[pro_parent] != rea_parent) or (
-                rea_parent is not None and rea_parent in explicit_pro and explicit_pro[rea_parent] != pro_parent
-            ):
-                continue
-        candidates[p] = [r]
-    for p, r in pins.items():
-        candidates[p] = [r]
-
-    order = sorted(range(n), key=lambda p: (len(candidates[p]), -len(pro_adj[p]), -pro_elem[p]))
-
-    # Pass 1: the fewest bonds any mapping can change. Pass 2: every mapping
-    # that achieves it, so the tie-break has something to choose between.
-    optimum = _optimum(n=n, order=order, candidates=candidates, rea_adj=rea_adj, pro_adj=pro_adj)
-    optimal = _search(
-        n=n, order=order, candidates=candidates, rea_adj=rea_adj, pro_adj=pro_adj, bound=optimum, collect=True
+    # Hydrogens on one atom are interchangeable, so when every one is a plain H on one heavy atom on both
+    # sides, and none is pinned or named, the search places heavy atoms only and counts each one's
+    # hydrogens: a pairing then pays |h_product - h_reactant|, exactly the hydrogen bonds it must change.
+    # Otherwise the hydrogens are atoms of the search like any other.
+    rea_h, pro_h = _terminal_hydrogens(rea), _terminal_hydrogens(pro)
+    named = set(breaking_bonds or ()) | set(forming_bonds or ())
+    fold = (
+        rea_h is not None
+        and pro_h is not None
+        and not any(pro_elem[p] == 1 for p in pins)
+        and not any(rea_elem[a] == 1 for pair in named for a in pair)
     )
+    if fold:
+        atoms = [p for p in range(n) if pro_elem[p] != 1]
+        rea_adj = [{a for a in near if rea_elem[a] != 1} for near in rea_adj]
+        pro_adj = [{a for a in near if pro_elem[a] != 1} for near in pro_adj]
+    else:
+        atoms, rea_h, pro_h = list(range(n)), [[] for _ in range(n)], [[] for _ in range(n)]
+    rea_count, pro_count = [len(h) for h in rea_h], [len(h) for h in pro_h]
 
     # The reactant's bonds do not depend on the mapping, so build this set once, not once per mapping.
     rea_bonds = bond_set(rea)
-    seen, mechanisms = set(), []
-    for m in optimal:
-        pro_bonds = bond_set(pro, order=m)
-        forming, breaking = frozenset(pro_bonds - rea_bonds), frozenset(rea_bonds - pro_bonds)
-        key = (forming, breaking)
-        if key not in seen:
-            seen.add(key)
-            mechanisms.append(Mechanism(list(m), forming, breaking))
+    spent = [0]  # one search budget across every pass and release
+
+    def tied(anchors, ceiling):
+        """Every distinct mechanism changing the fewest bonds, with the anchors fixed.
+
+        A known `ceiling` (a mapping exists changing that many) replaces the ladder with one pass under it.
+        """
+        fixed = [[anchors[p][0]] if p in anchors else candidates[p] for p in range(n)]
+        # Nearest the anchors first, so each atom placed has a placed neighbour and a wrong pick costs a bond;
+        # the rest by rarity.
+        near = _distances(pro_adj, [p for p in atoms if len(fixed[p]) == 1])
+        order = sorted(atoms, key=lambda p: (near.get(p, n), len(fixed[p]), -len(pro_adj[p]), -pro_elem[p]))
+        costs = _assignment_costs(order, fixed, rea_adj, pro_adj, rea_identity, pro_identity, rea_count, pro_count)
+        lower = _cheapest(costs[0])
+        if math.isinf(lower):
+            lower = 0.0  # no complete assignment of candidates: let the search report it
+        search = partial(
+            _search,
+            n=n,
+            order=order,
+            candidates=fixed,
+            rea_adj=rea_adj,
+            pro_adj=pro_adj,
+            pro_identity=pro_identity,
+            rea_identity=rea_identity,
+            rea_hydrogens=rea_count,
+            pro_hydrogens=pro_count,
+            symmetry=_symmetry(
+                pro, pro_adj, rea, rea_adj, fixed, order, *((pro_count, rea_count) if fold else (None, None))
+            ),
+            spent=spent,
+            costs=costs,
+        )
+        # Pass 1: the fewest bonds any mapping can change. Pass 2: every mapping that achieves it.
+        seen, mechanisms = set(), []
+        optimum = _optimum(search, lower) if ceiling is None else search(bound=ceiling + 1, collect=False)
+        for heavy in search(bound=optimum, collect=True):
+            for m in _with_hydrogens(heavy, rea_h, pro_h):
+                pro_bonds = bond_set(pro, order=m)
+                forming, breaking = frozenset(pro_bonds - rea_bonds), frozenset(rea_bonds - pro_bonds)
+                if (forming, breaking) not in seen:
+                    seen.add((forming, breaking))
+                    mechanisms.append(Mechanism(list(m), forming, breaking))
+        return mechanisms
+
+    # An anchor fixed at radius d has no changed bond within d - 1 bonds of it, or its surroundings would
+    # have differed; one that has was wrong, so it is released and the search run again. Named bonds were
+    # applied before anchoring, so they do not count; explicit pins carry radius 0 and are never released.
+    anchors = _anchors(rea, pro, pins, breaking_bonds, forming_bonds, (rea_count, pro_count) if fold else None)
+
+    # Releasing anchors only widens the search, so the mapping just found still bounds the next round.
+    kept, ceiling = dict(anchors), None
+    try:
+        while True:
+            mechanisms = tied(kept, ceiling)
+            changed = [a for mech in mechanisms for pair in mech.changing - named for a in pair]
+            near = _distances(_adjacency(rea), changed)
+            doubtful = [p for p, (r, radius) in kept.items() if near.get(r, n) < radius]
+            if not doubtful:
+                break
+            ceiling = len(mechanisms[0].changing)
+            for p in doubtful:
+                del kept[p]
+    except _ExhaustedError:
+        raise ValueError(
+            "Could not map these reactants onto these products within the search "
+            "budget. Map the atoms you care about in the SMILES, or pass "
+            "forming_bonds/breaking_bonds, and the search will respect them."
+        ) from None
+
+    def polarity(mech):
+        # A hydride moves to carbon and a proton to oxygen, not the reverse: each moving hydrogen's new
+        # partner is best as close in electronegativity to its old one as it can be. An element with no
+        # Pauling value (He, Ne, Ar) adds nothing.
+        old = {}
+        for pair in mech.breaking:
+            for h, partner in (pair, pair[::-1]):
+                if rea_elem[h] == 1:
+                    old.setdefault(h, []).append(partner)
+        total = 0.0
+        for pair in mech.forming:
+            for h, partner in (pair, pair[::-1]):
+                gaps = [
+                    abs(_PAULING[rea_elem[o]] - _PAULING[rea_elem[partner]])
+                    for o in old.get(h, ())
+                    if max(rea_elem[o], rea_elem[partner]) < len(_PAULING)
+                    and None not in (_PAULING[rea_elem[o]], _PAULING[rea_elem[partner]])
+                ]
+                total += min(gaps, default=0.0)
+        return round(total, 3)  # rounded so equal gaps tie exactly, whatever order they were summed in
+
+    # Atoms in a multiple or aromatic bond of the reactant: where pi electrons can move. Bond orders only
+    # break ties among equally minimal mechanisms; they never decide what is minimal.
+    unsaturated = {
+        a
+        for bond in rea.GetBonds()
+        if bond.GetBondTypeAsDouble() > 1
+        for a in (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+    }
 
     def rank(mech):
-        # Rank by distance from a six-atom pericyclic array, then atoms touched, then hydrogen bonds
-        # changed; sorted bonds make the final tie-break deterministic. The array is only a proxy:
-        # bond orders and thermal/photochemical context are unavailable here.
-        atoms = len({a for pair in mech.changing for a in pair})
+        # A pericyclic shift first: a six-atom array with no hydrogen moving and pi electrons at two or more
+        # of its ends (Claisen, Cope, Diels-Alder; not a proton relay closing six atoms). Then the fewest
+        # heavy atoms touched, the most hydrogen bonds changed, the most changes at pi atoms, and hydrogen
+        # polarity; sorted bonds make the final tie-break deterministic. Chosen on the Golden set and checked
+        # on Jaworski et al.'s (2019): 69% and 68% of curated mechanisms first among ties, against 44%.
+        heavy = {a for pair in mech.changing for a in pair if rea_elem[a] != 1}
         h_bonds = sum(1 for i, j in mech.changing if rea_elem[i] == 1 or rea_elem[j] == 1)
-        off_huckel = abs(_pericyclic_array(mech, rea_bonds) - _HUCKEL_ARRAY)
-        return (off_huckel, atoms, -h_bonds, sorted(mech.forming), sorted(mech.breaking))
+        at_pi = sum(1 for pair in mech.changing for a in pair if a in unsaturated and rea_elem[a] != 1)
+        pericyclic = h_bonds == 0 and at_pi >= 2 and _pericyclic_array(mech, rea_bonds) == _HUCKEL_ARRAY
+        return (
+            not pericyclic,
+            len(heavy),
+            -h_bonds,
+            -at_pi,
+            polarity(mech),
+            sorted(mech.forming),
+            sorted(mech.breaking),
+        )
 
     mechanisms.sort(key=rank)
     return mechanisms[0], mechanisms
 
 
-def _optimum(n, order, candidates, rea_adj, pro_adj):
+def _assignment_costs(order, candidates, rea_adj, pro_adj, rea_identity, pro_identity, rea_hydrogens, pro_hydrogens):
+    """Per-pair lower bounds on changed bonds, as a matrix over `order` x reactant atoms, with its indices.
+
+    An atom's neighbour kinds differ from its image's only through changed bonds at that atom, and a bond
+    between two searched atoms is counted at both its ends; so a mapping changes at least half its summed
+    neighbour mismatch plus its hydrogen-count differences, a sum over its pairs. Pairs outside the
+    candidates cost infinity, so the cheapest assignment of the matrix bounds every mapping the search tries.
+    """
+    targets = sorted({r for p in order for r in candidates[p]})
+    kinds = {k: i for i, k in enumerate(sorted({*rea_identity, *pro_identity}))}
+
+    def counts(atoms, adjacency, identity, hydrogens):
+        matrix = np.zeros((len(atoms), len(kinds) + 1))
+        for row, atom in enumerate(atoms):
+            for q in adjacency[atom]:
+                matrix[row, kinds[identity[q]]] += 0.5
+            matrix[row, -1] = hydrogens[atom]
+        return matrix
+
+    mismatch = np.abs(
+        counts(order, pro_adj, pro_identity, pro_hydrogens)[:, None, :]
+        - counts(targets, rea_adj, rea_identity, rea_hydrogens)[None, :, :]
+    ).sum(axis=2)
+    row, column = {p: i for i, p in enumerate(order)}, {r: j for j, r in enumerate(targets)}
+    allowed = np.zeros(mismatch.shape, dtype=bool)
+    for i, p in enumerate(order):
+        allowed[i, [column[r] for r in candidates[p]]] = True
+    mismatch[~allowed] = np.inf
+    return mismatch, row, column, targets
+
+
+def _cheapest(matrix):
+    """The cheapest assignment's total (scipy linear_sum_assignment), infinite when none is complete."""
+    try:
+        rows, columns = linear_sum_assignment(matrix)
+    except ValueError:
+        return math.inf
+    return float(matrix[rows, columns].sum())
+
+
+def _optimum(search, lower=0.0):
     """Find the fewest bonds any mapping can change, by raising the ceiling until one fits.
 
     A ceiling of k prunes any partial mapping that has already changed k bonds; real reactions change
     few, so starting low and raising prunes hard where no ceiling would (the incremental cost is a
     lower bound that says nothing near the root). Upstream's `_find_breaking_edges` deepens the same
-    way, one edge at a time.
+    way, one edge at a time. The ceiling starts just above `lower`, a proven bound on the answer.
     """
-    for bound in range(1, _MAX_CHANGING + 2):
-        cost = _search(
-            n=n, order=order, candidates=candidates, rea_adj=rea_adj, pro_adj=pro_adj, bound=bound, collect=False
-        )
+    for bound in range(math.ceil(lower - 1e-9) + 1, _MAX_CHANGING + 2):
+        cost = search(bound=bound, collect=False)
         if cost < bound:
             return cost
     raise ValueError(
@@ -298,17 +540,48 @@ def _optimum(n, order, candidates, rea_adj, pro_adj):
     )
 
 
-def _search(n, order, candidates, rea_adj, pro_adj, bound, collect):
-    """Branch-and-bound over element-preserving bijections, never exceeding `bound`.
+def _search(
+    n,
+    order,
+    candidates,
+    rea_adj,
+    pro_adj,
+    pro_identity,
+    rea_identity,
+    rea_hydrogens,
+    pro_hydrogens,
+    symmetry,
+    spent,
+    costs,
+    bound,
+    collect,
+):
+    """Branch-and-bound over element-preserving bijections of the atoms in `order`, never exceeding `bound`.
 
     With `collect` false, returns the fewest changing bonds achievable, or `bound`
     if nothing beats it. With it true, `bound` is that number and every mapping
-    achieving it is returned.
+    achieving it is returned, up to the swaps of identical parts `symmetry` orders (see `_symmetry`). Atoms left out
+    of `order` (folded hydrogens) stay None; each pairing also pays its hydrogen-count mismatch.
     """
     mapping = [None] * n
     inverse = [None] * n
-    best, nodes = bound, 0  # the incumbent: the ceiling until a cheaper complete mapping beats it
+    best = bound  # the incumbent: the ceiling until a cheaper complete mapping beats it
     found = []
+    below, entry, n_pairs = symmetry
+    matrix, row, column, targets = costs
+    placed_cost = 0.0  # the per-pair lower bounds of the pairs placed so far
+    entered = [0] * n_pairs  # atoms placed so far into each swappable reactant pair
+    unplaced = [Counter(pro_identity[q] for q in pro_adj[p]) for p in range(n)]
+    unassigned = [Counter(rea_identity[s] for s in rea_adj[r]) for r in range(n)]
+
+    def owing(p):
+        """Bonds a placed atom must still change: neighbours to come that its image's cannot match.
+
+        Each is a bond between this atom and one not yet placed, so no other placed atom counts it
+        and `delta` has not yet: adding these keeps the bound sound.
+        """
+        mine, theirs = unplaced[p], unassigned[mapping[p]]
+        return sum(abs(mine[e] - theirs[e]) for e in mine.keys() | theirs.keys())
 
     def delta(p, r):
         """Bonds changed by committing product atom `p` to reactant `r`.
@@ -318,16 +591,24 @@ def _search(n, order, candidates, rea_adj, pro_adj, bound, collect):
         """
         formed = sum(1 for q in pro_adj[p] if mapping[q] is not None and mapping[q] not in rea_adj[r])
         broken = sum(1 for s in rea_adj[r] if inverse[s] is not None and inverse[s] not in pro_adj[p])
-        return formed + broken
+        return formed + broken + abs(pro_hydrogens[p] - rea_hydrogens[r])
 
-    def step(depth, cost):
-        nonlocal best, nodes
+    def step(depth, cost, owed):
+        nonlocal best, placed_cost
         # Node budget: truncating quietly would return a first-leaf bound indistinguishable from an answer.
-        if nodes > _MAX_NODES:
+        spent[0] += 1
+        if spent[0] > _MAX_NODES:
             raise _ExhaustedError
-        nodes += 1
 
-        if depth == n:
+        # Near the root, where a subtree is largest, bound it by the pairs placed so far plus the cheapest
+        # assignment of the rest (see _assignment_costs): a doomed partial mapping is cut before it grows.
+        if depth <= _BOUND_DEPTH < len(order) - depth:
+            rest = matrix[np.ix_([row[q] for q in order[depth:]], [column[r] for r in targets if inverse[r] is None])]
+            lower = placed_cost + _cheapest(rest)
+            if (lower > best + 1e-9) if collect else (lower >= best - 1e-9):
+                return
+
+        if depth == len(order):
             if collect:
                 found.append(list(mapping))
             elif cost < best:
@@ -336,27 +617,42 @@ def _search(n, order, candidates, rea_adj, pro_adj, bound, collect):
 
         p = order[depth]
         for r in candidates[p]:
-            if inverse[r] is not None:
+            if inverse[r] is not None or any(r < mapping[a] for a in below[p]):
                 continue
+            if any(not entered[k] and b < r for k, b in entry[r]):
+                continue  # the first atom into a swappable reactant pair takes the smaller of the two
             d = cost + delta(p, r)
             # Ties are pruned while hunting the optimum, kept while enumerating.
             if (d > best) if collect else (d >= best):
                 continue
             mapping[p], inverse[r] = r, p
-            step(depth + 1, d)
+            placed_cost += matrix[row[p], column[r]]
+            for k, _ in entry[r]:
+                entered[k] += 1
+            # Placing p takes one neighbour of p's kind off each neighbour's count, so each placed neighbour's
+            # |unplaced - unassigned| for that kind moves by exactly one: down if its side had the surplus.
+            e, o = pro_identity[p], owed
+            for q in pro_adj[p]:
+                if mapping[q] is not None:
+                    o += -1 if unplaced[q][e] > unassigned[mapping[q]][e] else 1
+                unplaced[q][e] -= 1
+            for s in rea_adj[r]:
+                if inverse[s] is not None:
+                    o += -1 if unassigned[s][e] > unplaced[inverse[s]][e] else 1
+                unassigned[s][e] -= 1
+            o += owing(p)
+            if (d + o <= best) if collect else (d + o < best):
+                step(depth + 1, d, o)
+            for q in pro_adj[p]:
+                unplaced[q][pro_identity[p]] += 1
+            for s in rea_adj[r]:
+                unassigned[s][rea_identity[r]] += 1
+            for k, _ in entry[r]:
+                entered[k] -= 1
+            placed_cost -= matrix[row[p], column[r]]
             mapping[p], inverse[r] = None, None
-            # Enumerating ties is bounded: the optimum is proven, so at worst a tied alternative is unlisted.
-            if collect and len(found) > _MAX_OPTIMA:
-                return
 
-    try:
-        step(0, 0)
-    except _ExhaustedError:
-        raise ValueError(
-            "Could not map these reactants onto these products within the search "
-            "budget. Map the atoms you care about in the SMILES, or pass "
-            "forming_bonds/breaking_bonds, and the search will respect them."
-        ) from None
+    step(0, 0, 0)  # an exhausted budget raises _ExhaustedError for map_reaction to retry or report
     return found if collect else best
 
 
@@ -541,60 +837,49 @@ def _select_mapping(rea, pro, mapping, forming, breaking):
     return _validate_mapping((distinct or [ranked])[0].mapping, rea, pro)
 
 
-def _automorphisms(mol):
-    """Return reactant automorphisms and whether RDKit reached the search cap.
+def _mechanism_key(rea, mech):
+    """Canonical SMILES of the mechanism's ITS graph: kept bonds single, broken double, formed triple.
 
-    RDKit cannot distinguish an exact-size group from truncation. Incomplete groups can leave
-    equivalent mechanisms separate, but cannot merge chemically different mechanisms.
+    Atoms carry element and isotope only, as the mapper reads them, so resonance forms (the two
+    carboxylate oxygens, a Kekule ring) are one. Two mechanisms are one reaction relabelled exactly when
+    their ITS graphs are isomorphic, so no symmetry group is enumerated or capped. Equal keys are always
+    the same graph; RDKit's ranking does not backtrack, so a pathological graph could at worst keep
+    equivalent mechanisms apart.
     """
-    matches = mol.GetSubstructMatches(mol, uniquify=False, useChirality=False, maxMatches=_MAX_AUTOMORPHISMS)
-    truncated = len(matches) >= _MAX_AUTOMORPHISMS
-    if not matches:
-        matches = [tuple(range(mol.GetNumAtoms()))]
-    return matches, truncated
+    its = Chem.RWMol()
+    for atom in rea.GetAtoms():
+        label = Chem.Atom(atom.GetAtomicNum())
+        label.SetIsotope(atom.GetIsotope())
+        label.SetNoImplicit(True)
+        its.AddAtom(label)
+    for bond in rea.GetBonds():
+        pair = (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        broken = pair in mech.breaking or pair[::-1] in mech.breaking
+        its.AddBond(*pair, Chem.BondType.DOUBLE if broken else Chem.BondType.SINGLE)
+    for i, j in mech.forming:
+        its.AddBond(i, j, Chem.BondType.TRIPLE)
+    return Chem.MolToSmiles(its)
 
 
 def distinct_mechanisms(rea, mechanisms):
-    """Merge forming/breaking bond sets related by reactant symmetry."""
-    mechanisms = list(mechanisms)
-    if len(mechanisms) < 2:
-        return mechanisms
-    automorphisms, truncated = _automorphisms(rea)
-
-    def canonical(mech):
-        forms = []
-        for sigma in automorphisms:
-            f = frozenset(tuple(sorted((sigma[i], sigma[j]))) for i, j in mech.forming)
-            b = frozenset(tuple(sorted((sigma[i], sigma[j]))) for i, j in mech.breaking)
-            forms.append((sorted(f), sorted(b)))
-        return min(forms)  # the same label whichever member of the orbit we were handed
-
-    seen, out = set(), []
+    """Merge forming/breaking bond sets related by reactant symmetry, keeping the first of each."""
+    unique = {}
     for mech in mechanisms:
-        key = str(canonical(mech))
-        if key not in seen:
-            seen.add(key)
-            out.append(mech)
-
-    if truncated and len(out) > 1:
-        logger.warning(
-            f"This reactant has at least {_MAX_AUTOMORPHISMS} automorphisms, so the symmetry quotient "
-            f"is incomplete: the {len(out)} mechanism(s) reported are an UPPER BOUND and may include "
-            "duplicates of the same reaction relabelled. Pin the one you want with its `smiles` and "
-            "never its index pairs, or pass forming_bonds/breaking_bonds -- those are threaded into "
-            "the mapper's pre-solve and usually collapse the tie outright."
-        )
-    return out
+        unique.setdefault(_mechanism_key(rea, mech), mech)
+    return list(unique.values())
 
 
-# -- VeloxChem assist-id pre-solve ------------------------------------------
+# -- Anchors -------------------------------------------------------------------
 
-# Upstream's floor on the neighbourhood radius an assist-id pin must hold over (reactionmatcher.py:79).
-_ASSIST_MIN_DEPTH = 3
+# The smallest neighbourhood an anchor must hold over: VeloxChem's assist-id floor (reactionmatcher.py:79).
+_ANCHOR_MIN_RADIUS = 3
+
+# Atom-map label marking the centre of a keyed neighbourhood, above any input map number.
+_CENTRE = 10**6
 
 
 def _checked_pair(pair, n_atoms, parameter):
-    """Validate pairs before NetworkX can create unintended nodes."""
+    """Validate one caller-named atom pair."""
     if (
         not isinstance(pair, list | tuple)
         or len(pair) != 2
@@ -614,130 +899,211 @@ def _checked_pair(pair, n_atoms, parameter):
     return i, j
 
 
-def _apply_reaction_bonds(graph, n_atoms, breaking_bonds, forming_bonds):
-    """Apply caller-named bonds to the reactant graph as VeloxChem `_prepare_graph` does (211-217).
+def _named_bonds(adjacency, breaking_bonds, forming_bonds):
+    """Apply caller-named bonds to the reactant's adjacency, as VeloxChem `_prepare_graph` does (211-217).
 
-    Breaking edges are removed before forming edges are added. A missing breaking edge raises an
-    actionable error; an already-present forming edge is logged, matching NetworkX's idempotent add.
+    Breaking bonds go before forming bonds. A missing breaking bond raises an actionable error; an
+    already-present forming bond is logged and changes nothing.
     """
-    for pair in breaking_bonds or ():
-        i, j = _checked_pair(pair, n_atoms, "breaking_bonds")
-        if not graph.has_edge(i, j):
+    for i, j in breaking_bonds or ():
+        if j not in adjacency[i]:
             raise ValueError(
                 f"breaking_bonds names ({i}, {j}), which is not a bond of the reactant, so there is "
                 "nothing there to break. These are REACTANT atom indices and the pair must already be "
                 "bonded; a pair that is bonded in the PRODUCT belongs in forming_bonds."
             )
-        graph.remove_edge(i, j)
-    for pair in forming_bonds or ():
-        i, j = _checked_pair(pair, n_atoms, "forming_bonds")
-        if graph.has_edge(i, j):
+        adjacency[i].discard(j)
+        adjacency[j].discard(i)
+    for i, j in forming_bonds or ():
+        if j in adjacency[i]:
             logger.warning(
                 f"forming_bonds names ({i}, {j}), which is already a bond of the reactant, so it forms "
-                "nothing. The pre-solve is unchanged by it. This is almost always wrong numbering -- a "
+                "nothing. The anchoring is unchanged by it. This is almost always wrong numbering -- a "
                 "pair that is bonded in the reactant and not in the product belongs in breaking_bonds."
             )
-        graph.add_edge(i, j)
+        adjacency[i].add(j)
+        adjacency[j].add(i)
 
 
-def _reaction_graph(mol, breaking_bonds=None, forming_bonds=None):
-    """Build the VeloxChem assist-id graph, editing named bonds before collecting hydrogen neighbours.
-
-    Mapping search still uses the unedited endpoint molecules."""
-    graph = nx.Graph()
-    graph.add_nodes_from(range(mol.GetNumAtoms()))
-    for bond in mol.GetBonds():
-        graph.add_edge(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
-    _apply_reaction_bonds(graph, mol.GetNumAtoms(), breaking_bonds, forming_bonds)
-    for atom in mol.GetAtoms():
-        graph.nodes[atom.GetIdx()]["elem"] = atom.GetAtomicNum()
-    for node in graph.nodes:
-        hydrogens = [n for n in graph.neighbors(node) if graph.nodes[n]["elem"] == 1]
-        if hydrogens:
-            graph.nodes[node]["H_indices"] = hydrogens
-    return graph
+def _ball(adjacency, centre, radius):
+    """Every atom within `radius` bonds of `centre`."""
+    seen = frontier = {centre}
+    for _ in range(radius):
+        frontier = {q for v in frontier for q in adjacency[v]} - seen
+        seen = seen | frontier
+    return seen
 
 
-def _same_environment(a, b):
-    """Match two nodes on element, and on identity where one is already pinned."""
-    return a["elem"] == b["elem"] and a.get("assist_id", -1) == b.get("assist_id", -1)
+def _distances(adjacency, sources):
+    """Bonds from each atom to the nearest of `sources`; atoms they cannot reach are left out."""
+    distance, frontier, layer = dict.fromkeys(sources, 0), set(sources), 0
+    while frontier:
+        layer += 1
+        frontier = {q for v in frontier for q in adjacency[v]} - distance.keys()
+        distance |= dict.fromkeys(frontier, layer)
+    return distance
 
 
-def _ball(graph, centre, radius):
-    """Return the subgraph of everything within `radius` bonds of `centre`: a BFS ball."""
-    return graph.subgraph(nx.single_source_shortest_path_length(graph, centre, cutoff=radius))
+def _depth(adjacency, centre):
+    """Bonds from `centre` to the farthest atom of its molecule."""
+    depth, seen, frontier = 0, {centre}, {centre}
+    while frontier := {q for v in frontier for q in adjacency[v]} - seen:
+        seen |= frontier
+        depth += 1
+    return depth
 
 
-def _assist_order(n):
-    """Walk the atoms on upstream's coprime stride, so no region is searched first just by index.
+def _skeleton(mol, adjacency, hydrogens=None):
+    """`mol` as a bare graph to key: element and isotope, `adjacency`'s bonds all single, and no H beyond
+    the folded `hydrogens` counts given.
 
-    Which of several interchangeable atoms gets pinned first is arbitrary but must be reproducible;
-    striding by a value coprime to `n` visits every atom once in an index-independent order.
+    Nothing is sanitised, so valence, aromaticity and charge -- where RDKit is fragile for metals and
+    boron -- never enter. An anchored atom carries its reactant index + 1 as an atom-map label. Returned
+    with each bond's two atoms, in bond-index order.
     """
-    step = 2 * n // 3
-    while n and math.gcd(step, n) != 1:
-        step -= 1
-    return [(i * step) % n for i in range(n)]
+    skeleton, ends = Chem.RWMol(), []
+    for atom in mol.GetAtoms():
+        bare = Chem.Atom(atom.GetAtomicNum())
+        bare.SetIsotope(atom.GetIsotope())
+        bare.SetNoImplicit(True)
+        bare.SetNumExplicitHs(hydrogens[atom.GetIdx()] if hydrogens else 0)
+        skeleton.AddAtom(bare)
+    for i, neighbours in enumerate(adjacency):
+        for j in neighbours:
+            if i < j:
+                skeleton.AddBond(i, j, Chem.BondType.SINGLE)
+                ends.append((i, j))
+    return skeleton, ends
 
 
-def _record_assist(rea_graph, pro_graph, inner, pins):
-    """Record the neighbourhood correspondence and equivalent hydrogens as assist-id pins."""
-    for r, p in inner.items():
-        pins[p] = r
-    for r, p in inner.items():
-        rea_graph.nodes[r]["assist_id"] = r
-        pro_graph.nodes[p]["assist_id"] = r
-        rea_h = rea_graph.nodes[r].get("H_indices")
-        pro_h = pro_graph.nodes[p].get("H_indices")
-        if rea_h and pro_h and len(rea_h) == len(pro_h):
-            for rh, ph in zip(rea_h, pro_h, strict=True):
-                rea_graph.nodes[rh]["assist_id"] = rh
-                pro_graph.nodes[ph]["assist_id"] = rh
-                pins[ph] = rh
+def _canonical(skeleton, atoms, centre=None, bare=()):
+    """Canonical SMILES of the subgraph on `atoms` (`centre` marked), and the atoms in output order.
+
+    `bare` atoms are written without their hydrogen counts: on the rim of a ball, where a hydrogen would lie
+    one bond outside it, so a key reads the same whether hydrogens are atoms or counts.
+
+    The subgraph is copied out first (PathToSubmol): RDKit's MolFragmentToSmiles breaks ties using the
+    rest of the molecule, so the same labelled fragment can be written two ways as anchors land
+    elsewhere. A copy makes the string a function of the subgraph alone; equal strings are the same
+    rooted graph.
+    """
+    mol, ends = skeleton
+    inside = set(atoms)
+    bonds = [k for k, (a, b) in enumerate(ends) if a in inside and b in inside]
+    new = {}
+    part = Chem.RWMol(Chem.PathToSubmol(mol, bonds, atomMap=new)) if bonds else Chem.RWMol()
+    for atom in sorted(inside - new.keys()):  # atoms with no bond inside: a lone ion, a folded water
+        new[atom] = part.AddAtom(mol.GetAtomWithIdx(atom))
+    if centre is not None:
+        part.GetAtomWithIdx(new[centre]).SetAtomMapNum(_CENTRE)
+    for atom in bare:
+        part.GetAtomWithIdx(new[atom]).SetNumExplicitHs(0)
+    smiles = Chem.MolToSmiles(part, allHsExplicit=True)  # else a bare skeleton writes no H as the default count
+    old = {i: a for a, i in new.items()}
+    return smiles, [old[i] for i in part.GetPropsAsDict(True, True)["_smilesAtomOutputOrder"]]
 
 
-def _assist_pins(rea, pro, breaking_bonds=None, forming_bonds=None):
-    """Pin isomorphic neighbourhoods using VeloxChem ReactionMatcher._calculate_assist_ids.
+def _rooted(skeleton, centre, atoms, bare=()):
+    """Canonical SMILES of `atoms` with `centre` marked: equal strings are the same rooted graph."""
+    return _canonical(skeleton, atoms, centre, bare)[0]
 
-    Check radii depth and depth-1 down to its minimum depth of 3. Named bonds edit only
-    the reactant pre-solve graph before hydrogen lists are built."""
-    n = rea.GetNumAtoms()
-    rea_graph = _reaction_graph(rea, breaking_bonds, forming_bonds)
-    pro_graph = _reaction_graph(pro)
-    order = _assist_order(n)
 
-    # Start one past half the widest connected component's diameter -- enough to span its radius.
-    depth = 1
-    for component in nx.connected_components(rea_graph):
-        depth = max(depth, math.ceil(nx.diameter(rea_graph.subgraph(component)) / 2))
-    depth += 1
+def _anchors(rea, pro, pins, breaking_bonds=None, forming_bonds=None, counts=None):
+    """Pair the atoms whose surroundings show them untouched, so the search maps only the reaction.
 
-    pins = {}
-    while depth >= _ASSIST_MIN_DEPTH:
-        for r in order:
-            if rea_graph.nodes[r]["elem"] == 1 or rea_graph.nodes[r].get("assist_id") is not None:
+    A heavy atom's key is the canonical SMILES of everything within `radius` bonds of it, with it
+    marked and earlier anchors labelled. A key held by one atom on each side anchors that pair. Only
+    when no key is unique does a shared key anchor a pair, and only if both sides hold it equally often
+    and one side's holders are interchangeable -- the whole molecule rooted at each reads the same -- so
+    a symmetry carries any choice to any other;
+    one such pair at a time, since it relabels what the next depends on. The radius runs from half
+    the widest reactant down to `_ANCHOR_MIN_RADIUS`, each repeated until nothing new anchors; atom
+    order plays no part. An anchored atom's hydrogens pair by isotope and index: they are
+    interchangeable. Like VeloxChem's assist ids, this reads unchanged surroundings as an unchanged
+    atom. The explicit `pins` label from the start, so no anchor contradicts them, and named bonds
+    edit the reactant first. Given `counts` (each atom's terminal hydrogens, reactant then product), the
+    keys read hydrogens as those counts, not as atoms, and no hydrogen anchors.
+
+    Returns product atom -> (reactant atom, radius it was fixed at): the pins, at radius 0, and every
+    anchor.
+    """
+    mols = (rea, pro)
+    adjacency = [_adjacency(rea), _adjacency(pro)]
+    _named_bonds(adjacency[0], breaking_bonds, forming_bonds)
+    radius = (max((_depth(adjacency[0], a) for a in range(rea.GetNumAtoms())), default=0) + 1) // 2 + 1
+    if counts:  # hydrogens are counts on their atoms, never atoms of a ball
+        for mol, adj in zip(mols, adjacency, strict=True):
+            for atom in mol.GetAtoms():
+                if atom.GetAtomicNum() == 1:
+                    h = atom.GetIdx()
+                    for q in adj[h]:
+                        adj[q].discard(h)
+                    adj[h] = set()
+    skeletons = [_skeleton(*parts) for parts in zip(mols, adjacency, counts or (None, None), strict=True)]
+    anchored, used = {}, set()  # product atom -> (reactant atom, radius); the reactant atoms taken
+    keys = ({}, {})  # side -> {atom: (ball size, key)}, dropped when an anchor lands within reach
+
+    def label(p, r, radius):
+        anchored[p] = r, radius
+        used.add(r)
+        for side, atom in ((0, r), (1, p)):
+            skeletons[side][0].GetAtomWithIdx(atom).SetAtomMapNum(r + 1)
+            for near in _ball(adjacency[side], atom, radius):  # every key whose ball holds it, now or later
+                keys[side].pop(near, None)
+
+    def hydrogens(side, atom):
+        mol = mols[side]
+        found = (q for q in adjacency[side][atom] if mol.GetAtomWithIdx(q).GetAtomicNum() == 1)
+        return sorted(found, key=lambda q: (mol.GetAtomWithIdx(q).GetIsotope(), q))
+
+    def anchor(p, r, radius):
+        label(p, r, radius)
+        rh, ph = hydrogens(0, r), hydrogens(1, p)
+        if len(rh) == len(ph):
+            for a, b in zip(rh, ph, strict=True):
+                if a not in used and b not in anchored:
+                    label(b, a, radius)
+
+    def holders(side, radius):
+        found = {}
+        for atom in range(mols[side].GetNumAtoms()):
+            if atom in (used if side == 0 else anchored) or mols[side].GetAtomWithIdx(atom).GetAtomicNum() == 1:
                 continue
-            rea_ball = _ball(rea_graph, r, depth)
-            for p in order:
-                pro_node = pro_graph.nodes[p]
-                if pro_node.get("assist_id") is not None or pro_node["elem"] != rea_graph.nodes[r]["elem"]:
-                    continue
-                pro_ball = _ball(pro_graph, p, depth)
-                if rea_ball.number_of_nodes() != pro_ball.number_of_nodes():
-                    continue
-                outer = GraphMatcher(rea_ball, pro_ball, node_match=_same_environment)
-                if not outer.is_isomorphic():
-                    continue
-                # The inner ball must match too, so the pin does not rest on the ragged outer shell.
-                rea_inner = _ball(rea_graph, r, depth - 1)
-                pro_inner = _ball(pro_graph, p, depth - 1)
-                if not GraphMatcher(rea_inner, pro_inner, node_match=_same_environment).is_isomorphic():
-                    continue
-                inner = {rn: pn for rn, pn in outer.mapping.items() if rn in rea_inner}
-                _record_assist(rea_graph, pro_graph, inner, pins)
+            ball = _ball(adjacency[side], atom, radius)
+            rim = ball - _ball(adjacency[side], atom, radius - 1)
+            size, key = keys[side].get(atom, (None, None))
+            if size != (len(ball), len(rim)):  # balls nest as the radius shrinks: same sizes, same ball and rim
+                key = _rooted(skeletons[side], atom, ball, rim)
+                keys[side][atom] = (len(ball), len(rim)), key
+            found.setdefault(key, []).append(atom)
+        return found
+
+    def interchangeable(side, atoms):
+        everything = range(mols[side].GetNumAtoms())
+        return len({_rooted(skeletons[side], atom, everything) for atom in atoms}) == 1
+
+    for p, r in pins.items():
+        label(p, r, 0)
+    while radius >= _ANCHOR_MIN_RADIUS:
+        while True:
+            found = holders(0, radius), holders(1, radius)
+            shared = [(found[1].get(key, []), atoms) for key, atoms in found[0].items()]
+            pairs = [(ps[0], rs[0]) for ps, rs in shared if len(rs) == len(ps) == 1]
+            if not pairs:
+                pairs = next(
+                    (
+                        [(ps[0], rs[0])]
+                        for ps, rs in shared
+                        if len(rs) == len(ps) > 1 and (interchangeable(0, rs) or interchangeable(1, ps))
+                    ),
+                    [],
+                )
+            if not pairs:
                 break
-        depth -= 1
-    return pins
+            for p, r in pairs:
+                anchor(p, r, radius)
+        radius -= 1
+    return anchored
 
 
 # SMILES reporting and proton relays extend VeloxChem's molecule-based mapper.
@@ -799,18 +1165,16 @@ def _route_relay(rea, pro, mapping, sites, label):
         hydrogens.append(attached)
 
     r2p = invert(mapping)
-    work = Chem.RWMol(pro)
-    for transfer_index, (proton, acceptor) in enumerate(transfers):
-        current, acceptor_p = r2p[proton], r2p[acceptor]
-        for site, attached in zip(sites, hydrogens, strict=True):
-            donor, spare = r2p[site], r2p[attached[transfer_index]]
-            work.RemoveBond(acceptor_p, current)
-            work.AddBond(donor, current, Chem.BondType.SINGLE)
-            work.RemoveBond(donor, spare)
-            work.AddBond(acceptor_p, spare, Chem.BondType.SINGLE)
-            current = spare
-    pro2 = work.GetMol()
-    return rea, pro2, _mechanism(rea, pro2, mapping)
+    mapping = list(mapping)
+    for transfer_index, (proton, _acceptor) in enumerate(transfers):
+        arriving = r2p[proton]
+        for attached in hydrogens:
+            spare = r2p[attached[transfer_index]]
+            mapping[arriving], mapping[spare] = mapping[spare], mapping[arriving]
+    product = Chem.Mol(pro)
+    for p, r in enumerate(mapping):
+        product.GetAtomWithIdx(p).SetAtomMapNum(rea.GetAtomWithIdx(r).GetAtomMapNum())
+    return rea, product, _mechanism(rea, product, mapping)
 
 
 def _protic_sites(mol, atoms=None):
@@ -967,23 +1331,14 @@ def map_smiles(
 
     hydrogens=True prints explicit mapped H atoms. strict=True requires an explicit mechanism
     selection for ambiguous reactions; strict=False accepts the first ranked choice."""
-    rea, pro, chosen, distinct, truncated = _analyse(reaction)
+    rea, pro, chosen, distinct = _analyse(reaction)
     if mechanism is not None and (isinstance(mechanism, bool) or not isinstance(mechanism, Integral) or mechanism < 0):
         raise ValueError("mechanism must be a non-negative integer selection")
     if mechanism is None and strict and len(distinct) > 1:
-        # With the symmetry quotient truncated, `len(distinct)` is an upper bound and two of these
-        # may be one reaction relabelled -- so `strict` says what it can prove and no more.
-        bound = (
-            " That count is an UPPER BOUND: this reactant's automorphism group hit the search cap, so "
-            "the symmetry quotient could not rule out that some of these are the same reaction "
-            "relabelled."
-            if truncated
-            else ""
-        )
         raise ValueError(
             f"This reaction is ambiguous on connectivity alone -- {len(distinct)} distinct "
             "mechanisms change the same number of bonds. Call rxts.mechanisms() to see them, "
-            f"map the atoms you care about in the input SMILES, or pass mechanism=n to choose.{bound}"
+            "map the atoms you care about in the input SMILES, or pass mechanism=n to choose."
         )
     if mechanism is not None:
         if mechanism >= len(distinct):
@@ -1000,7 +1355,7 @@ def map_smiles(
 def _analyse(reaction):
     """Parse and enumerate unconstrained mapping choices once.
 
-    Return reactant, product, chosen mechanism, distinct mechanisms and symmetry-truncation flag.
+    Return reactant, product, chosen mechanism and distinct mechanisms.
     """
     split = split_reaction_smiles(reaction)
     if split is None:
@@ -1013,9 +1368,7 @@ def _analyse(reaction):
     rea = _from_smiles(reactant_smiles, "reactants")
     pro = _from_smiles(product_smiles, "products")
     chosen, tied = map_reaction(rea, pro)
-    distinct = distinct_mechanisms(rea, tied)
-    truncated = _automorphisms(rea)[1] if len(distinct) > 1 else False
-    return rea, pro, chosen, distinct, truncated
+    return rea, pro, chosen, distinct_mechanisms(rea, tied)
 
 
 def _mapped_smiles(rea, pro, chosen, hydrogens=False, preserve_maps=False):
@@ -1055,7 +1408,7 @@ def _mapped_smiles(rea, pro, chosen, hydrogens=False, preserve_maps=False):
         # RemoveHs keeps the heavy atoms' map numbers; it only stops the hydrogens being written.
         rea, pro = Chem.RemoveHs(rea), Chem.RemoveHs(pro)
 
-    smiles = f"{Chem.MolToSmiles(rea)}>>{Chem.MolToSmiles(pro)}"
+    smiles = f"{rxembed.cxsmiles(rea)}>>{rxembed.cxsmiles(pro)}"
     return smiles, labels
 
 
@@ -1144,7 +1497,7 @@ def _mechanism_mols(reaction, product=None, add_relay=None, *, charge=None, rela
             "('CC(=O)OCC.O>>CC(=O)O.OCC')."
         )
 
-    rea, pro, _, distinct, _truncated = _analyse(reaction)
+    rea, pro, _, distinct = _analyse(reaction)
     if all(value is None for value in (add_relay, relay, relay_map)):
         for mech in distinct:
             yield rea, pro, mech
