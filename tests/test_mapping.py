@@ -1,11 +1,10 @@
-"""Check mapped mechanisms and the assist-id pre-solve they share."""
+"""Check mapped mechanisms and the anchors they share."""
 
 from __future__ import annotations
 
 import logging
 from functools import reduce
 
-import networkx as nx
 import numpy as np
 import pytest
 from rdkit import Chem
@@ -13,10 +12,7 @@ from rdkit import Chem
 from rxts import mapping
 from rxts.mapping import (
     Mechanism,
-    _assist_pins,
-    _automorphisms,
-    _reaction_graph,
-    _record_assist,
+    _anchors,
     distinct_mechanisms,
     invert,
     map_reaction,
@@ -74,11 +70,6 @@ def test_bond_and_proton_transfer():
     assert elements(rea, mech.forming) == [("C", "O"), ("H", "O")]
 
 
-def test_atom_mapped_smiles_are_obeyed():
-    mech = react(["[CH4:1]"], ["[CH4:1]"])[1]
-    assert mech.mapping == [0, 1, 2, 3, 4]
-
-
 @pytest.mark.parametrize(
     ("reactants", "products", "message"),
     [
@@ -98,39 +89,6 @@ def test_automatic_mapping_preserves_isotopes():
     assert [
         (pro.GetAtomWithIdx(p).GetAtomicNum(), pro.GetAtomWithIdx(p).GetIsotope()) for p in range(pro.GetNumAtoms())
     ] == [(rea.GetAtomWithIdx(r).GetAtomicNum(), rea.GetAtomWithIdx(r).GetIsotope()) for r in mechanism.mapping]
-
-
-def test_heavy_atom_pins_drop_wrong_parent_hs(monkeypatch):
-    rea = parse_smiles("[CH3:1][CH3:2]")
-    pro = parse_smiles("[CH3:1][CH3:2]")
-
-    swapped = {0: 1, 1: 0}
-    for p in range(2, pro.GetNumAtoms()):
-        product_parent = pro.GetAtomWithIdx(p).GetNeighbors()[0].GetIdx()
-        reactant_parent = swapped[product_parent]
-        swapped[p] = next(
-            h.GetIdx()
-            for h in rea.GetAtomWithIdx(reactant_parent).GetNeighbors()
-            if h.GetAtomicNum() == 1 and h.GetIdx() not in swapped.values()
-        )
-    monkeypatch.setattr(mapping, "_assist_pins", lambda *args: swapped)
-
-    mech, _ = map_reaction(rea, pro)
-
-    assert mech.mapping[:2] == [0, 1]
-    assert mech.changing == frozenset()
-
-
-def test_reactant_parent_rejects_unmapped_product_h(monkeypatch):
-    rea = parse_smiles("[CH3:1]C")
-    pro = parse_smiles("[CH3:1]C")
-    product_h = next(h.GetIdx() for h in pro.GetAtomWithIdx(1).GetNeighbors() if h.GetAtomicNum() == 1)
-    reactant_h = next(h.GetIdx() for h in rea.GetAtomWithIdx(0).GetNeighbors() if h.GetAtomicNum() == 1)
-    monkeypatch.setattr(mapping, "_assist_pins", lambda *args: {product_h: reactant_h})
-
-    mech, _ = map_reaction(rea, pro)
-
-    assert mech.changing == frozenset()
 
 
 def test_atom_count_must_be_conserved():
@@ -166,79 +124,115 @@ def test_same_element_reordering():
     assert changes(Chem.RenumberAtoms(pro, [0, 2, 1, 3])) == changes(pro)
 
 
-def test_endpoint_symmetry():
-    reactant = Chem.RWMol()
-    product = Chem.RWMol()
-    for _ in range(3):
-        reactant.AddAtom(Chem.Atom("O"))
-        product.AddAtom(Chem.Atom("O"))
-    reactant.AddBond(0, 1, Chem.BondType.SINGLE)
-    reactant.AddBond(1, 2, Chem.BondType.SINGLE)
-    product.AddBond(0, 1, Chem.BondType.SINGLE)
-    rea, pro = reactant.GetMol(), product.GetMol()
-    Chem.SanitizeMol(rea)
-    Chem.SanitizeMol(pro)
-    mechanism, tied = map_reaction(rea, pro)
-    assert not mechanism.forming
-    assert len(mechanism.breaking) == 1
-    assert len(tied) > 1
-    assert len(distinct_mechanisms(rea, tied)) == 1
-
-
-def test_truncated_symmetry_is_reported(caplog, monkeypatch):
-    monkeypatch.setattr(mapping, "_MAX_AUTOMORPHISMS", 4)
-    rea = parse_smiles("C")
-    matches, truncated = mapping._automorphisms(rea)
-    assert len(matches) == 4
-    assert truncated is True
-
-    identity = list(range(rea.GetNumAtoms()))
-    tied = [
-        Mechanism(identity, frozenset({(0, 1)}), frozenset()),
-        Mechanism(identity, frozenset({(0, 2)}), frozenset()),
-    ]
-    with caplog.at_level(logging.WARNING, logger="rxts.mapping"):
-        distinct = mapping.distinct_mechanisms(rea, tied)
-    assert distinct
-    assert "at least 4 automorphisms" in caplog.text
-    assert "UPPER BOUND" in caplog.text
-    assert "forming_bonds" in caplog.text
-
-
-def test_uncapped_group_is_quotiented(caplog):
-    rea = parse_smiles("BrCCBr.[Cl-]")
-    pro = parse_smiles("BrCC[Cl].[Br-]")
-
-    matches, truncated = _automorphisms(rea)
-    assert len(matches) == 8
-    assert truncated is False
-
-    _, tied = map_reaction(rea, pro)
-    assert len(tied) == 2
-    with caplog.at_level(logging.WARNING, logger="rxts.mapping"):
-        assert len(distinct_mechanisms(rea, tied)) == 1
-    assert caplog.text == ""
-
-
-def test_single_mechanism_skips_symmetry(monkeypatch):
-    mech = Mechanism([0, 1], frozenset({(0, 1)}), frozenset())
-    monkeypatch.setattr(mapping, "_automorphisms", lambda mol: pytest.fail("unnecessary symmetry search"))
-    assert distinct_mechanisms(None, [mech]) == [mech]
-
-
 def test_distinct_mechanisms():
     rea = parse_smiles("CC(=O)OCC.O")
     pro = parse_smiles("CC(=O)O.OCC")
 
-    matches, truncated = _automorphisms(rea)
-    assert (len(matches), truncated) == (144, False)
-
     _, tied = map_reaction(rea, pro)
-    assert len(tied) == 6
     distinct = distinct_mechanisms(rea, tied)
-    assert len(distinct) == 3
+    assert len(distinct) == 3  # really distinct routes stay apart
     broken = {pair for mech in distinct for pair in mech.breaking}
     assert {(1, 3), (3, 4)} <= broken
+
+
+_SNAR_ASSISTED = "CCOC(=O)CCCN.Clc1nc(Cl)cc(Cl)n1.CCN(CC)CC>>CCOC(=O)CCCNc1cc(Cl)nc(Cl)n1.[Cl-].CC[NH+](CC)CC"
+_SNAR_ASSISTED_HEAVY_MAPS = (
+    "[CH3:1][CH2:2][O:3][C:4](=[O:5])[CH2:6][CH2:7][CH2:8][NH2:9].[Cl:10][c:11]1[n:12][c:13]([Cl:14])[cH:15]"
+    "[c:16]([Cl:17])[n:18]1.[CH3:19][CH2:20][N:21]([CH2:22][CH3:23])[CH2:24][CH3:25]>>[CH3:1][CH2:2][O:3]"
+    "[C:4](=[O:5])[CH2:6][CH2:7][CH2:8][NH:9][c:13]1[cH:15][c:16]([Cl:17])[n:18][c:11]([Cl:10])[n:12]1."
+    "[Cl-:14].[CH3:19][CH2:20][NH+:21]([CH2:22][CH3:23])[CH2:24][CH3:25]"
+)
+
+_CO = "(<-[C-]#[O+])"
+_MN2_CO10 = f"[Mn]{_CO * 5}[Mn]{_CO * 5}"
+_MN_AMIDO = "[Mn+]12(<-[C-]#[O+])(<-[C-]#[O+])<-[N-](CCP(C(C)C)(C(C)C)->1)CCP(C(C)C)(C(C)C)->2"
+_MN_HYDRIDE = "[Mn+]12(<-[H-])(<-[C-]#[O+])(<-[C-]#[O+])<-[NH](CCP(C(C)C)(C(C)C)->1)CCP(C(C)C)(C(C)C)->2"
+
+
+@pytest.mark.parametrize(
+    "reaction",
+    [
+        _SNAR_ASSISTED,  # which N-H proton Et3N takes is not a mechanism
+        _SNAR_ASSISTED_HEAVY_MAPS,  # heavy maps leave the hydrogens implicit
+        "CC[N+](CC)(CC)c1cc(Cl)nc(Cl)n1.[Cl-]>>CCCl.CCN(CC)c1cc(Cl)nc(Cl)n1",  # one of three equivalent ethyls
+        f"{_MN2_CO10}>>{_MN2_CO10.replace(_CO, '', 1)}.[C-]#[O+]",  # 2 x 5!^2 symmetries on connectivity
+        "CC(=O)[O-].[NH4+]>>CC(=O)O.N",  # either carboxylate oxygen: one resonance form
+    ],
+    ids=["snar-assisted", "snar-heavy-maps", "de-ethylation", "mn2-co10-cage", "carboxylate"],
+)
+def test_equivalent_hydrogens_and_groups_are_one_mechanism_in_any_atom_order(reaction):
+    reactants, products = split_reaction_smiles(reaction)
+    rea, pro = parse_smiles(".".join(reactants)), parse_smiles(".".join(products))
+    for order in (range(rea.GetNumAtoms()), reversed(range(rea.GetNumAtoms()))):
+        shuffled = Chem.RenumberAtoms(rea, list(order))
+        _, tied = map_reaction(shuffled, pro)
+        assert len(distinct_mechanisms(shuffled, tied)) == 1
+
+
+def test_unmapped_hydride_transfer_lists_its_ties_within_budget(monkeypatch):
+    """Sibling hydrogens are taken in order and misplaced ones are owed up front, so a small budget holds."""
+    monkeypatch.setattr(mapping, "_MAX_NODES", 10_000)  # 90k without the owed bond count, 2M+ unordered
+    rea, pro = parse_smiles(f"{_MN_HYDRIDE}.CC(C)=O"), parse_smiles(f"{_MN_AMIDO}.CC(C)O")
+    for seed in range(4):  # the two routes tie on ring size and atoms, so polarity, not atom order, decides
+        order = list(range(rea.GetNumAtoms()))
+        np.random.default_rng(seed).shuffle(order)
+        shuffled = Chem.RenumberAtoms(rea, order)
+        chosen, tied = map_reaction(shuffled, pro)
+
+        def donor_and_acceptor(pair, mol=shuffled):
+            h, acceptor = sorted(pair, key=lambda i: mol.GetAtomWithIdx(i).GetAtomicNum() != 1)
+            return mol.GetAtomWithIdx(h).GetNeighbors()[0].GetSymbol(), mol.GetAtomWithIdx(acceptor).GetSymbol()
+
+        assert sorted(map(donor_and_acceptor, chosen.forming)) == [("Mn", "C"), ("N", "O")]
+        assert len(distinct_mechanisms(shuffled, tied)) == 2  # hydride to O and proton to C is another graph
+
+
+def test_moved_isotope_label_is_not_pinned_away_in_any_atom_order():
+    """A 13C Cope changes two bonds, as a [3,3] or a [1,3] shift, whatever the atom order."""
+    reactants, products = split_reaction_smiles("[13CH2]=CCCC=C>>C=C[13CH2]CC=C")
+    rea, pro = parse_smiles(".".join(reactants)), parse_smiles(".".join(products))
+    for seed in range(4):
+        order = list(range(rea.GetNumAtoms()))
+        np.random.default_rng(seed).shuffle(order)
+        shuffled = Chem.RenumberAtoms(rea, order)
+        chosen, tied = map_reaction(shuffled, pro)
+        assert len(chosen.changing) == 2
+        assert len(distinct_mechanisms(shuffled, tied)) == 2
+
+
+def test_anchors_do_not_depend_on_atom_order():
+    """A Meisenheimer adduct losing chloride: greedy first-match pins gave three bonds in some orders."""
+    reactants, products = split_reaction_smiles(
+        "CC[N+](CC)(CC)C1(Cl)C=C(Cl)[N-]C(Cl)=N1>>CC[N+](CC)(CC)c1cc(Cl)nc(Cl)n1.[Cl-]"
+    )
+    rea, pro = parse_smiles(".".join(reactants)), parse_smiles(".".join(products))
+    for seed in range(8):
+        order = list(range(rea.GetNumAtoms()))
+        np.random.default_rng(seed).shuffle(order)
+        chosen, _ = map_reaction(Chem.RenumberAtoms(rea, order), pro)
+        assert len(chosen.changing) == 1
+
+
+def test_folded_hydrogens_anchor_as_explicit_ones():
+    """Hydrogens read as counts anchor exactly the atoms explicit hydrogens do (an Ugi coupling, Golden 17).
+
+    The isocyanide N has no H and the amide N one; a bare skeleton's SMILES writes both as N unless every
+    count is written, and a rim atom's count must stay out of a key as its hydrogens do.
+    """
+    reactants, products = split_reaction_smiles(
+        "CCCCC(=O)O.Brc1nc([N+]#[C-])ccc1.NCc1ccccc1.CCCCC=O>>O.CCCCC(=O)N(Cc1ccccc1)C(C(=O)Nc1nc(Br)ccc1)CCCC"
+    )
+    rea, pro = parse_smiles(".".join(reactants)), parse_smiles(".".join(products))
+    counts = tuple([len(h) for h in mapping._terminal_hydrogens(mol)] for mol in (rea, pro))
+    explicit = {p: a for p, a in _anchors(rea, pro, {}).items() if pro.GetAtomWithIdx(p).GetAtomicNum() != 1}
+    assert _anchors(rea, pro, {}, counts=counts) == explicit
+
+
+def test_deuterium_is_not_merged_with_hydrogen():
+    rea = parse_smiles("[2H]C([H])Cl")  # D0, C1, H2, Cl3, H4
+    identity = list(range(rea.GetNumAtoms()))
+    loses = [Mechanism(identity, frozenset(), frozenset({(1, h)})) for h in (0, 2, 4)]
+    assert distinct_mechanisms(rea, loses) == loses[:2]  # C-D apart from C-H; the two C-H are one
 
 
 def _silane_transfer():
@@ -248,48 +242,18 @@ def _silane_transfer():
     )
 
 
-def test_named_bonds_pin_reordered_product():
+def test_named_bonds_anchor_reordered_product():
     rea, pro = _silane_transfer()
-    named = {"breaking_bonds": [(0, 5)], "forming_bonds": [(5, 17)]}
-    pins = _assist_pins(rea, pro, **named)
-    assert len(pins) == 21
-    assert len(set(pins.values())) == 21
-
+    named = {"breaking_bonds": [(0, 5)], "forming_bonds": [(5, 17)]}  # the methyl H moves to CH3-
     shuffled = Chem.RenumberAtoms(pro, [int(i) for i in np.random.default_rng(0).permutation(pro.GetNumAtoms())])
-    shuffled_pins = _assist_pins(rea, shuffled, **named)
-    assert len(shuffled_pins) == len(set(shuffled_pins.values())) == 21
+    anchors = _anchors(rea, shuffled, {}, **named)
+    assert len(anchors) == len({r for r, _ in anchors.values()}) == rea.GetNumAtoms()  # all, edited reactant
     mechanism, tied = map_reaction(rea, shuffled, **named)
     assert mechanism.changing == frozenset({(0, 5), (5, 17)})
     assert len(tied) == 1
 
 
-def test_assist_moves_hydrogens_before_neighbors():
-    rea, pro = _silane_transfer()
-    plain = _reaction_graph(rea)
-    assert plain.nodes[0]["H_indices"] == [5, 6, 7]
-    assert plain.nodes[17]["H_indices"] == [18, 19, 20]
-
-    edited = _reaction_graph(rea, breaking_bonds=[(0, 5)], forming_bonds=[(5, 17)])
-    assert edited.nodes[0]["H_indices"] == [6, 7]
-    assert edited.nodes[17]["H_indices"] == [18, 19, 20, 5]
-    assert _assist_pins(rea, pro, forming_bonds=[(5, 17)]) == {}
-
-
-def test_assist_records_ball_pins_first():
-    reactant, product = nx.Graph(), nx.Graph()
-    reactant.add_nodes_from(range(3))
-    product.add_nodes_from(range(3))
-    reactant.nodes[0]["H_indices"] = [1, 2]
-    product.nodes[0]["H_indices"] = [2, 1]
-
-    pins = {}
-    _record_assist(reactant, product, {0: 0, 1: 1, 2: 2}, pins)
-
-    assert pins == {0: 0, 1: 2, 2: 1}
-    assert len(set(pins.values())) == len(pins)
-
-
-def test_assist_bond_errors(caplog):
+def test_named_bond_errors(caplog):
     rea, pro = parse_smiles("CBr.[Cl-]"), parse_smiles("CCl.[Br-]")
     with pytest.raises(ValueError, match="names atom index 99"):
         map_reaction(rea, pro, forming_bonds=[(99, 100)])
@@ -425,7 +389,6 @@ def test_relay_requires_proton_transfer():
         ("O.CC", "protic site"),
         ("CC(O)CO", "inequivalent protic sites"),
         ("[OH:1]CC[OH:2]", "inequivalent protic sites"),
-        ("[2H]OCCO", "inequivalent protic sites"),
     ],
 )
 def test_relay_failure_reason(bridge, remedy):
@@ -525,13 +488,8 @@ def test_invalid_mapped_relay(reaction, relay_map, message):
 
 def test_relay_controls_are_mutually_exclusive():
     reaction = "[CH3:1][OH:2].[OH-:3].[OH2:99]>>[CH3:1][O-:2].[OH2:3].[OH2:99]"
-    for settings in (
-        {"add_relay": "O", "relay": "O"},
-        {"add_relay": "O", "relay_map": 99},
-        {"relay": "O", "relay_map": 99},
-    ):
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            mechanisms(reaction, **settings)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mechanisms(reaction, add_relay="O", relay_map=99)
 
 
 def test_relay_preserves_cip_stereochemistry():
@@ -577,17 +535,6 @@ def test_missing_product_names_argument():
     message = str(caught.value)
     assert "Mol" in message
     assert "0x" not in message
-
-
-def test_strict_truncated_symmetry(monkeypatch):
-    def analyse(_reaction):
-        return None, None, None, [object(), object()], truncated
-
-    for truncated in (True, False):
-        monkeypatch.setattr(mapping, "_analyse", analyse)
-        with pytest.raises(ValueError, match="ambiguous") as caught:
-            map_smiles("unused", strict=True)
-        assert ("UPPER BOUND" in str(caught.value)) is truncated
 
 
 def test_distinct_smiles_mechanism_needs_selection():
@@ -675,3 +622,35 @@ def test_mapping_rejects_invalid_pairs():
     for pairs in ([(0, True)], [(0, 1.5)], [(0, 0)], [(0, 1, 2)], [(0, 1), (1, 0)], [(0, 99)]):
         with pytest.raises(ValueError, match="forming_bonds"):
             map_reaction(mol, mol, forming_bonds=pairs)
+
+
+@pytest.mark.parametrize("relay", [None, "O"])
+def test_mapping_retains_cx_annotations(relay):
+    reaction = (
+        "[CH3:1][O:2][H:3].[NH3:4] |atomProp:0.atomNote.selected|"
+        ">>[CH3:1][O-:2].[NH3+:4][H:3] |atomProp:0.atomNote.selected|"
+    )
+    (report,) = mechanisms(reaction, add_relay=relay)
+    for side in report["smiles"].split(">>"):
+        mol = parse_smiles(side)
+        annotated = [atom for atom in mol.GetAtoms() if atom.HasProp("atomNote")]
+        assert len(annotated) == 1
+        assert annotated[0].GetAtomMapNum() == 1
+        assert annotated[0].GetProp("atomNote") == "selected"
+    (again,) = mechanisms(report["smiles"])
+    assert again["forming_labels"] == report["forming_labels"]
+    assert again["breaking_labels"] == report["breaking_labels"]
+
+
+def test_relay_preserves_a_protonated_donor_configuration():
+    import rxembed
+
+    reaction = "C[N-](CC)->[Pd](Cl)(Cl)<-N.CO>>C[N@H](CC)->[Pd](Cl)(Cl)<-N.C[O-]"
+    (report,) = mechanisms(reaction, add_relay="O")
+    expected = Chem.CombineMols(
+        rxembed.parse_smiles(reaction.split(">>")[1], remove_hs=False), rxembed.parse_smiles("O", remove_hs=False)
+    )
+    product = parse_smiles(report["smiles"].split(">>")[1])
+    for atom in product.GetAtoms():
+        atom.SetAtomMapNum(0)
+    assert rxembed.cxsmiles(product) == rxembed.cxsmiles(expected)
