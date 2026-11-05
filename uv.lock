@@ -1451,39 +1451,12 @@ wheels = [
 [[package]]
 name = "rxembed"
 version = "0.2.0"
-source = { editable = "../refactor/rxembed" }
+source = { git = "https://github.com/aligfellow/rxembed#6199c6e63b24e6b1366457fdd0b7ad34c1ed05d1" }
 dependencies = [
     { name = "networkx" },
     { name = "numpy" },
     { name = "rdkit" },
     { name = "xyzgraph" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "matplotlib", marker = "extra == 'workflow'" },
-    { name = "networkx" },
-    { name = "numpy" },
-    { name = "openconf", marker = "extra == 'search'", specifier = ">=0.0.17" },
-    { name = "rdkit", specifier = ">=2026.9.1" },
-    { name = "scikit-learn", marker = "extra == 'workflow'" },
-    { name = "scipy", marker = "extra == 'workflow'" },
-    { name = "xyzgraph", specifier = ">=1.6.19" },
-]
-provides-extras = ["search", "workflow"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pre-commit", specifier = ">=3.5.0" },
-    { name = "pytest", specifier = ">=8.3.5" },
-    { name = "pytest-cov", specifier = ">=5.0.0" },
-    { name = "ruff", specifier = ">=0.14.14" },
-    { name = "rxembed", extras = ["search", "workflow"] },
-    { name = "ty", specifier = ">=0.0.14" },
-]
-notebooks = [
-    { name = "ipykernel" },
-    { name = "xyzrender", specifier = ">=0.3.8" },
 ]
 
 [[package]]
@@ -1529,7 +1502,7 @@ requires-dist = [
     { name = "pillow" },
     { name = "plotprofile", marker = "extra == 'viz'", specifier = ">=2.0.0" },
     { name = "rdkit", specifier = ">=2026.9.1" },
-    { name = "rxembed", editable = "../refactor/rxembed" },
+    { name = "rxembed", git = "https://github.com/aligfellow/rxembed" },
     { name = "tblite", specifier = ">=0.7.0" },
     { name = "threadpoolctl", specifier = ">=3.0" },
     { name = "xyzgraph", specifier = ">=1.6.19" },
@@ -1783,16 +1756,16 @@ wheels = [
 
 [[package]]
 name = "xyzgraph"
-version = "1.6.19"
+version = "1.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "networkx" },
     { name = "numpy" },
     { name = "rdkit" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/80/4a/53150492b9b18445b1ace94da6b51c312c4cfa477971ee865f31d9602d5c/xyzgraph-1.6.19.tar.gz", hash = "sha256:71a90d7b158bce88c3267069a5e7bfaa057212026c825d393602dd1b9d4128e9", size = 201090, upload-time = "2026-11-02T11:31:21.585Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/d3/cdff0f08919b2cc12394af0345e36a043f37777222c2ab195c337482da51/xyzgraph-1.7.0.tar.gz", hash = "sha256:e2fefd0b26bc1974dc56ee16874e15fe1338127a810f8b623836cec2be2c314b", size = 204386, upload-time = "2026-11-05T13:49:42.763Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e0/fa/d2377376e5d496151cb5a650416b802883e3995ad5e0db11c9ab9beb7a0c/xyzgraph-1.6.19-py3-none-any.whl", hash = "sha256:7c955275597ce6a01e0e1581c167e6a2fd6b837693ff9df4ee952e3e231a8a9a", size = 140116, upload-time = "2026-11-02T11:31:19.071Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/1c/ec11c00ebf7f0807d85a25f2addc641a057a0c9853aebfb3b6f08b186726/xyzgraph-1.7.0-py3-none-any.whl", hash = "sha256:69850932ddce4b35db95281df05c4a12d9b9874898407711b627256c5f97168d", size = 141507, upload-time = "2026-11-05T13:49:41.26Z" },
 ]
 
 [[package]]

@@ -8,7 +8,7 @@ Reaction mapping and force-field TS guesses, adapted from VeloxChem, with rxembe
 uv sync --extra ff  # add --extra viz for the notebook
 ```
 
-GFN-FF needs a Fortran compiler and BLAS/LAPACK; MMFF works without the `ff` extra. This checkout currently uses `../refactor/rxembed` and a pinned GFN-FF fork; see [pyproject.toml](pyproject.toml).
+GFN-FF needs a Fortran compiler and BLAS/LAPACK; MMFF works without the `ff` extra. rxembed comes from its GitHub main and GFN-FF from a pinned fork; `uv.lock` records both commits.
 
 ## Use
 
