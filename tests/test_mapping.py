@@ -327,8 +327,8 @@ def test_unchanged_dative_direction():
         return mol.GetMol()
 
     reactant, same, reversed_bond = coordinated(False), coordinated(False), coordinated(True)
-    _, same_error = mapping._unchanged_component(reactant, same, [0, 1], {0, 1})
-    _, reverse_error = mapping._unchanged_component(reactant, reversed_bond, [0, 1], {0, 1})
+    same_error = mapping._changed(reactant, same, [0, 1], {0, 1})
+    reverse_error = mapping._changed(reactant, reversed_bond, [0, 1], {0, 1})
 
     assert same_error is None
     assert reverse_error == "with changing bonds"
