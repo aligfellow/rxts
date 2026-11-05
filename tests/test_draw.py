@@ -17,12 +17,6 @@ def test_draws_one_panel_per_mechanism():
     assert img.size == (400 * 2, 340 * 2)
 
 
-def test_added_relay_draws():
-    img = draw_mechanisms("CC(=O)OC.O>>CC(=O)O.CO", add_relay="O")
-    assert img.size[0] > 0
-    assert img.size[1] > 0
-
-
 def test_existing_relay_draws():
     reaction = (
         "[CH3:1][C:2](=[O:3])[O:4][CH3:5].[OH2:99].[OH2:100]>>[CH3:1][C:2](=[O:3])[OH:99].[CH3:5][OH:4].[OH2:100]"

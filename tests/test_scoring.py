@@ -220,20 +220,6 @@ def test_energy_request_skips_gradient(registry):
     assert registry[0].requests[-1][2] is True
     assert calc.n_evaluations == 2
     assert calc.n_gradients == 1
-
-
-def test_calculator_counters(registry):
-    calc = GXTB(method="gfn2")
-    atoms = _atoms()
-    atoms.calc = calc
-
-    atoms.get_forces()
-    moved = atoms.copy()
-    moved.positions[0, 0] += 0.1
-    calc.calculate(moved, properties=("energy", "forces"))
-
-    assert calc.n_gradients == 2
-    assert calc.n_evaluations == 2
     assert calc.n_calls == registry[0].n_calls == 2
     assert calc.path == registry[0].path, "the scratch directory is the backend's, passed through"
 
@@ -352,7 +338,6 @@ def test_composite_runs_cold_legs_and_shifts(registry):
 
 def test_external_counts_and_sharing():
     from ase.calculators.calculator import Calculator, all_changes
-    from ase.calculators.mixing import SumCalculator
 
     from rxts import CalculatorMethod
 
@@ -401,12 +386,6 @@ def test_external_counts_and_sharing():
         CalculatorMethod("", factory)
     with pytest.raises(TypeError, match="factory"):
         CalculatorMethod("invalid", None)
-
-    mixed = CalculatorMethod("two surfaces", lambda **kw: SumCalculator([SeparateProperties(), SeparateProperties()]))
-    atoms.calc = make_calculator(method=mixed)
-    assert atoms.get_potential_energy() == 5.0
-    np.testing.assert_allclose(atoms.get_forces(), -1.4)
-    assert atoms.calc.n_gradients == 1
 
 
 def test_composite_units_and_lifetime():

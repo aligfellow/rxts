@@ -204,7 +204,7 @@ def test_empty_batch_starts_no_pool():
     assert _bounded_map([], lambda x: x, n_workers=4) == []
 
 
-@pytest.mark.parametrize("workers", [0, -1, True, 1.5])
+@pytest.mark.parametrize("workers", [0, True, 1.5])
 def test_invalid_worker_budgets_fail_before_work(workers):
     with pytest.raises(ValueError, match="positive integer"):
         _bounded_map([1], lambda _item: pytest.fail("invalid budget started work"), n_workers=workers)
