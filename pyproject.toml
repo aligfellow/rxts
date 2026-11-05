@@ -13,14 +13,14 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.24",
-    "rdkit>=2026.3.6",
+    "rdkit>=2026.9.1",
     "networkx>=3.0",
     "ase>=3.22",
     "tblite>=0.7.0",
     "pillow",
     "threadpoolctl>=3.0",
-    "rxembed @ git+https://github.com/aligfellow/rxembed",
-    "xyzgraph>=1.6.16",
+    "rxembed>=0.2.0",
+    "xyzgraph>=1.6.19",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -28,7 +28,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-ff = ["gfnff @ git+https://github.com/aligfellow/gfnff@graph-metal-filters"]
+ff = ["gfnff @ git+https://github.com/aligfellow/gfnff@cda6e5976627b93bfb56eb543aafda91a6252d22"]
 viz = ["plotprofile>=2.0.0", "xyzrender>=0.3"]
 
 [project.scripts]
@@ -36,6 +36,10 @@ rxts = "rxts.cli:main"
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxts"
+
+[tool.uv.sources]
+# shortcut: use the local rxembed refactor until its species/coembed API is published.
+rxembed = { path = "../refactor/rxembed", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["src"]
