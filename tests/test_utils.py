@@ -5,12 +5,13 @@ import time
 
 import numpy as np
 import pytest
+import rxembed
 from ase import Atoms
 from rdkit import Chem
 from rdkit.Chem import rdMolTransforms
 
 from rxts import utils as parallel
-from rxts.builder import _geometry_known, as_molecules
+from rxts.mapping import parse_smiles
 from rxts.utils import (
     _bounded_map,
     _worker_count,
@@ -87,14 +88,13 @@ Cl  0.000 -2.300  0.000
 
 def test_xyz_text_is_not_an_xyz_path():
     assert is_xyz_file(_PD_COMPLEX) is False
-    assert _geometry_known(_PD_COMPLEX) is True
-    assert (is_xyz_file("thing.xyz"), _geometry_known("thing.xyz")) == (True, True)
-    assert (is_xyz_file("CCO"), _geometry_known("CCO")) == (False, False)
+    assert is_xyz_file("thing.xyz") is True
+    assert is_xyz_file("CCO") is False
 
-    # Raw conformers still need placement; selected endpoints and XYZ bypass it.
-    conformer_bearing = as_molecules("CCO")[0]
+    # A Mol with coordinates is supplied geometry, like an XYZ endpoint.
+    conformer_bearing = rxembed.embed(parse_smiles("CCO"), n=1, seed=0xF00D, threads=1).mol
     assert conformer_bearing.GetNumConformers() == 1
-    assert _geometry_known(conformer_bearing) is False
+    assert is_xyz_file(conformer_bearing) is False
 
 
 def test_read_xyz_ignores_path_suffix(tmp_path):
@@ -127,7 +127,7 @@ def test_read_xyz_rejects_invalid_frame_values():
 
 
 def test_coordinate_writes_leave_source_unchanged():
-    mol = as_molecules("CCO")[0]
+    mol = rxembed.embed(parse_smiles("CCO"), n=1, seed=0xF00D, threads=1).mol
     before = np.array(mol.GetConformer().GetPositions())
     moved = np.asarray(before) + 5.0
 

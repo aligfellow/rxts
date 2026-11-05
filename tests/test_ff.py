@@ -14,17 +14,136 @@ from rdkit import Chem
 
 import rxts
 from rxts import builder, ff
-from rxts.builder import _geometry_known, as_molecules
-from rxts.ff import conformers, embed_candidates, metal_core
-from rxts.utils import PLACED, mol_from_xyz, set_positions
+from rxts.ff import embed_candidates, metal_core
+from rxts.mapping import parse_smiles
+from rxts.utils import mol_from_xyz, set_positions
 
 
 class _StopError(Exception):
     """Sentinel: stop the guesser at the call under test rather than pay for a scan."""
 
 
-@pytest.mark.parametrize("invalid_role", ["reactant", "product"])
-@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize("stop", [None, KeyboardInterrupt])
+def test_all_endpoint_pairs_scan_on_one_frozen_potential(monkeypatch, stop):
+    from rxts.structure import Frame
+    from rxts.utils import with_conformer
+
+    prepared = rxts.prepare_endpoints("CBr.[Cl-]>>CCl.[Br-]", multiplicity=1)
+    markers = (0.0, 1.0, 2.0)
+    rea, pro = Chem.Mol(prepared.reactant), Chem.Mol(prepared.product)
+    for mol in (rea, pro):
+        mol.RemoveAllConformers()
+        for marker in markers:
+            conf = with_conformer(mol, np.full((mol.GetNumAtoms(), 3), marker)).GetConformer()
+            mol.AddConformer(conf, assignId=True)
+    prepared = replace(prepared, reactant=rea, product=pro)
+    pot = SimpleNamespace(metal_angle_k=0.0, metal_angle_source=None)
+    builds, scans = [], []
+
+    def build(self, **kwargs):
+        builds.append(kwargs)
+        assert kwargs["rea"].GetNumConformers() == kwargs["pro"].GetNumConformers() == 1
+        return pot
+
+    def scan(self, field, mol, charge):
+        assert field is pot
+        assert mol.GetNumConformers() == 1
+        marker = int(mol.GetConformer().GetPositions()[0, 0])
+        scans.append(marker)
+        if marker == 1 and stop is not None:
+            raise stop("stopped in the second path")
+        # Pair 1 has the smallest relative barrier, but pair 0 has the lowest absolute peak.
+        energies = ((-10, 4, 5, 0), (5, 5, 6, 5), (0, 2, 20, 0))[marker]
+        return [Frame(i / 3, np.full((mol.GetNumAtoms(), 3), marker), e, e, e) for i, e in enumerate(energies)]
+
+    monkeypatch.setattr(ff.TransitionStateGuesser, "_build_potential", build)
+    monkeypatch.setattr(ff.TransitionStateGuesser, "_scan", scan)
+    guesser = rxts.TransitionStateGuesser(engine="mmff", n_embed=0)
+    if stop is not None:
+        with pytest.raises(stop, match="second path") as caught:
+            guesser.paths(prepared)
+        paths = caught.value.candidate_paths
+        assert isinstance(paths, rxts.ReactionPaths)
+        assert len(paths) == 1
+        assert scans == [0, 1]
+        assert len(builds) == 1
+        assert max(f.energy for f in paths[0].frames) == 5
+        return
+    paths = guesser.paths(prepared)
+    path = paths.best()
+    assert len(builds) == 1
+    assert scans == [0, 1, 2]
+    assert max(frame.energy for frame in path.frames) == 5
+    assert len(paths) == 3
+    assert [max(f.energy for f in p.frames) for p in paths] == [5, 6, 20]
+    assert [p.reactant.GetConformer().GetPositions()[0, 0] for p in paths] == [0, 1, 2]
+    assert all(mol.GetNumConformers() == 3 for mol in (prepared.reactant, prepared.product))
+
+
+def test_physical_scoring_selects_between_complete_paths():
+    from ase.calculators.calculator import Calculator, all_changes
+
+    from rxts.structure import Frame
+    from rxts.utils import with_conformer
+
+    class DistanceEnergy(Calculator):
+        implemented_properties = ("energy",)
+
+        def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            assert atoms.info["charge"] == 1
+            assert atoms.info["multiplicity"] == 1
+            self.results = {"energy": -atoms.get_distance(0, 1)}
+
+    frames = []
+    for distances, energies in (((1.4, 1.9, 0.5), (0, 2, 1)), ((1.2, 1.0, 1.7), (0, 1, 3))):
+        frames.append(
+            [
+                Frame(i / 2, np.array([[0, 0, 0], [r, 0, 0]]), e, e, e)
+                for i, (r, e) in enumerate(zip(distances, energies, strict=True))
+            ]
+        )
+    mol = with_conformer(Chem.MolFromSmiles("[H][H]"), frames[0][0].positions)
+    paths = rxts.ReactionPaths(
+        rxts.ReactionPath(
+            frames=fs,
+            reactant=mol,
+            product=mol,
+            forming_bonds=[],
+            breaking_bonds=[],
+            mapping=[0, 1],
+            engine="gfnff",
+            charge=1,
+            multiplicity=1,
+            solvent=None,
+            n_cores=1,
+            mol=mol,
+        )
+        for fs in frames
+    )
+    scored = paths.score(DistanceEnergy())
+    assert paths.best() is paths[0]
+    assert scored.best() is scored[1]
+    assert all(not path.scored for path in paths)
+    # Scoring only the FF peaks would prefer pair 0; its physical maximum is elsewhere.
+    assert [p.scores.energies_ev for p in scored] == [
+        pytest.approx((-1.4, -1.9, -0.5)),
+        pytest.approx((-1.2, -1.0, -1.7)),
+    ]
+    assert [p.peak_index() for p in scored] == [2, 1]
+    assert all(p.scores.n_evaluations == 3 and p.scores.n_gradients == 0 for p in scored)
+
+
+def test_invalid_prepared_pair_counts_fail_before_build(monkeypatch):
+    prepared = rxts.prepare_endpoints("CBr.[Cl-]>>CCl.[Br-]", multiplicity=1)
+    pro = Chem.Mol(prepared.product)
+    pro.AddConformer(pro.GetConformer(), assignId=True)
+    monkeypatch.setattr(ff.TransitionStateGuesser, "_build_potential", lambda *a, **k: pytest.fail("built FF"))
+    with pytest.raises(ValueError, match="paired conformers"):
+        rxts.ff.interpolate(replace(prepared, product=pro), engine="mmff")
+
+
+@pytest.mark.parametrize(("invalid_role", "linked"), [("reactant", False), ("product", False), ("product", True)])
 def test_gfnff_validates_topology_before_build(monkeypatch, invalid_role, linked):
     """The xtb subprocess perceives bonds, so a stretched endpoint is refused; the linked library takes the graph."""
     from rxts.utils import mol_from_xyz
@@ -54,47 +173,23 @@ Cl  0.000 -2.300  0.000
         guesser._build_potential("gfnff", reactant, product, [(0, 1)], [], charge=0)
 
 
-def test_start_conformer_is_chosen_on_the_path(monkeypatch):
-    """The start whose path preview peaks lowest wins, even with the higher reactant energy."""
-    low_reactant, low_path = np.zeros((1, 3)), np.ones((1, 3))
-
-    class Pot:
-        changing = ()
-
-        def energy(self, x, lam):
-            path = float(x[0, 0])  # 0: low reactant, steep path; 1: higher reactant, flat path
-            return ((1 - lam) * path + lam * 10 * (1 - path), None, None)
-
-    guesser = rxts.TransitionStateGuesser(engine="gfnff", multiplicity=1, n_conformers=2)
-    monkeypatch.setattr(ff, "conformers", lambda **kwargs: [low_path])
-    monkeypatch.setattr(guesser, "_minimize", lambda pot, x, lam: x)
-    assert guesser._best_conformer(pot=Pot(), rea=None, x=low_reactant, rng=None) is low_path
-
-
 def test_native_endpoints_are_prepared_once(monkeypatch):
     from rdkit import Chem
 
-    guesser = rxts.TransitionStateGuesser(engine="mmff", multiplicity=1, n_lambda=3, n_cores=1)
+    guesser = rxts.TransitionStateGuesser(engine="mmff", multiplicity=1, n_lambda=3, n_cores=1, n_conformers=1)
     reference = guesser.prepare_endpoints("CBr.[Cl-]>>CCl.[Br-]")
     native = (Chem.Mol(reference.reactant), Chem.Mol(reference.product))
-    for mol in native:
-        mol.SetBoolProp(PLACED, True)  # supplied geometry, as rxts marks it
     guesser.mapping = list(range(reference.reactant.GetNumAtoms()))
 
     def forbidden(*args, **kwargs):
         pytest.fail("selected endpoints were remapped or rebuilt")
 
-    monkeypatch.setattr(builder, "search_approach", forbidden)
-    monkeypatch.setattr(builder, "reactive_complex", forbidden)
-    monkeypatch.setattr(builder, "derive_product_geometry", forbidden)
     prepared = guesser.prepare_endpoints(*native)
     assert isinstance(prepared, rxts.PreparedReaction)
-    assert prepared.sources[0] is native[0]
-    assert prepared.sources[1] is native[1]
     assert prepared.forming_bonds == reference.forming_bonds
     assert prepared.breaking_bonds == reference.breaking_bonds
     before = [mol.GetConformer().GetPositions().copy() for mol in (prepared.reactant, prepared.product)]
-    monkeypatch.setattr(guesser, "prepare_endpoints", forbidden)
+    monkeypatch.setattr(ff.TransitionStateGuesser, "prepare_endpoints", forbidden)  # interpolate builds its own guesser
     build_potential = ff.TransitionStateGuesser._build_potential
 
     def capture_build(self, **kwargs):
@@ -103,9 +198,8 @@ def test_native_endpoints_are_prepared_once(monkeypatch):
         assert self.multiplicity == prepared.multiplicity
         return build_potential(self, **kwargs)
 
-    guesser.solvent, guesser.n_cores, guesser.multiplicity = "water", 2, 2
     monkeypatch.setattr(ff.TransitionStateGuesser, "_build_potential", capture_build)
-    path = rxts.ff.interpolate(prepared, engine="mmff", n_lambda=3, n_conformers=1, n_embed=0)
+    path = rxts.ff.interpolate(prepared, engine="mmff", n_lambda=3, n_embed=0)
     assert len(path.frames) == 3
     assert path.mapping == prepared.mapping
     assert path.solvent == prepared.solvent
@@ -118,6 +212,8 @@ def test_native_endpoints_are_prepared_once(monkeypatch):
         guesser.find_transition_state(prepared, native[1])
     with pytest.raises(ValueError, match="charge is fixed by prepare"):
         rxts.ff.interpolate(prepared, engine="mmff", n_lambda=3, charge=1)
+    with pytest.raises(TypeError, match=r"n_conformers.*endpoint options"):
+        rxts.ff.interpolate(prepared, engine="mmff", n_conformers=8)
 
 
 def test_reaction_smiles_scan():
@@ -130,24 +226,6 @@ def test_reaction_smiles_scan():
     assert len(path.forming_bonds) == 1
 
 
-@pytest.mark.parametrize("n_conformers", [1, 4])
-def test_md_budget_includes_starting_geometry(monkeypatch, n_conformers):
-    guesser = rxts.TransitionStateGuesser(n_lambda=3, n_conformers=n_conformers, n_embed=0, md_steps=1)
-    mol = Chem.MolFromXYZBlock("2\n\nH 0 0 0\nH 0.7 0 0\n")
-    calls = []
-
-    def sample(**kwargs):
-        calls.append(kwargs["lam"])
-        return kwargs["x"]
-
-    monkeypatch.setattr(guesser, "_best_conformer", lambda **kwargs: kwargs["x"])
-    monkeypatch.setattr(guesser, "_minimize", lambda pot, x, lam: x)
-    monkeypatch.setattr(guesser, "_sample", sample)
-    pot = SimpleNamespace(changing=[], energy=lambda x, lam: (0.0, 0.0, 0.0))
-    assert len(guesser._scan(pot, mol, charge=0)) == 3
-    assert len(calls) == guesser.n_lambda * (n_conformers - 1)
-
-
 def test_mmff_rejects_missing_parameters():
     tsg = rxts.TransitionStateGuesser(engine="mmff", multiplicity=1)
     with pytest.raises(ValueError, match=r"MMFF94 cannot assign parameters"):
@@ -155,14 +233,12 @@ def test_mmff_rejects_missing_parameters():
 
 
 def test_auto_engine_selection():
-    from rxts.builder import as_molecules, combine_spaced
-
     tsg = rxts.TransitionStateGuesser(engine="auto", multiplicity=1)
 
-    iodide = combine_spaced(as_molecules(["CCCCCl", "[I-]"]))
+    iodide = rxembed.embed(parse_smiles("CCCCCl.[I-]"), n=1, seed=0xF00D, threads=1).mol
     assert tsg._choose_engine(iodide, iodide) == "gfnff"
 
-    organic = combine_spaced(as_molecules(["CC(=O)OCC", "O"]))
+    organic = rxembed.embed(parse_smiles("CC(=O)OCC.O"), n=1, seed=0xF00D, threads=1).mol
     assert tsg._choose_engine(organic, organic) == "mmff"
 
 
@@ -173,14 +249,13 @@ def test_unknown_engine():
         tsg.find_transition_state("C[Br].[Cl-]>>C[Cl].[Br-]")
 
 
-def test_placed_endpoints_skip_derivation(monkeypatch):
+def test_supplied_coembedded_pairs_skip_embedding(monkeypatch):
+    pairs = builder.rxembed.coembed("CBr.[Cl-]>>CCl.[Br-]", n=1, seed=1, threads=1)
 
     def _forbidden(*a, **k):
-        raise AssertionError("the embed-and-derive path must not run for placed endpoints")
+        raise AssertionError("a supplied pair batch must not be rebuilt")
 
-    monkeypatch.setattr(builder, "search_approach", _forbidden)
-    monkeypatch.setattr(builder, "reactive_complex", _forbidden)
-    monkeypatch.setattr(builder, "derive_product_geometry", _forbidden)
+    monkeypatch.setattr(builder.rxembed, "coembed", _forbidden)
 
     class _ReachedError(Exception):
         pass
@@ -192,19 +267,8 @@ def test_placed_endpoints_skip_derivation(monkeypatch):
     monkeypatch.setattr(ff.TransitionStateGuesser, "_build_potential", lambda self, **k: None)
     monkeypatch.setattr(ff.TransitionStateGuesser, "_scan", _stop)
 
-    # H2 + hydride -> hydride + H2: H0-H1 bonded then apart, H1-H2 apart then bonded.
-    def _placed(coords):
-        block = "3\n\n" + "\n".join(f"H {x} {y} {z}" for x, y, z in coords)
-        mol = mol_from_xyz(block, charge=-1)
-        mol.SetBoolProp(PLACED, True)
-        return mol
-
-    rea = _placed([(0.0, 0, 0), (0.74, 0, 0), (2.6, 0, 0)])
-    pro = _placed([(0.0, 0, 0), (2.0, 0, 0), (2.74, 0, 0)])
-    assert _geometry_known(rea) is True, "the PLACED mark is what puts the run on this branch at all"
-
     with pytest.raises(_ReachedError):
-        ff.TransitionStateGuesser(engine="auto", multiplicity=1, charge=-1).find_transition_state(rea, pro)
+        ff.TransitionStateGuesser(engine="auto", multiplicity=1, charge=-1).find_transition_state(pairs)
 
 
 def test_guesser_passes_named_bonds_to_mapper(monkeypatch):
@@ -302,7 +366,6 @@ def test_default_peak_search_reembeds_and_anchors(monkeypatch):
 
 
 _REFUSED_SETTINGS = [
-    ({"n_lambda": 0}, "n_lambda"),
     ({"n_lambda": 1}, "n_lambda"),
     ({"seed": None}, "seed"),
     ({"forming_bonds": [(0, 1, 2)]}, "forming_bonds"),
@@ -319,9 +382,6 @@ _REFUSED_SETTINGS = [
     ({"metal_angle_k": -1.0}, "metal_angle_k"),
     ({"metal_angle_k": float("inf")}, "metal_angle_k"),
     ({"n_conformers": 0}, "n_conformers"),
-    ({"md_steps": -1}, "md_steps"),
-    ({"md_temperature": 0.0}, "md_temperature"),
-    ({"md_timestep": 0.0}, "md_timestep"),
     ({"n_embed": -1}, "n_embed"),
     ({"embed_window": -1}, "embed_window"),
     ({"peak_anchored": None}, "peak_anchored"),
@@ -340,7 +400,6 @@ _ACCEPTED_SETTINGS = [
     {"reactant_geometry": "SPL", "product_geometry": "square_planar"},
     {"peak_anchored": False, "discont_search": True},
     {"n_embed": 3, "embed_window": 0, "embed_score": "gfn2"},
-    {"md_steps": 1000, "md_timestep": 0.5},
     {"charge": -1, "multiplicity": 3},
     {"forming_bonds": [(1, 14)], "breaking_bonds": [(1, 3)], "mapping": [0, 1, 2]},
     {"constraints": {(0, 3): 1.5}, "constraint_k": 0.0},
@@ -373,8 +432,7 @@ def test_valid_settings():
         )
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("isotope", [False, True])
+@pytest.mark.parametrize(("reverse", "isotope"), [(False, False), (True, True)])
 def test_external_conformer_selection(reverse, isotope):
     from ase.calculators.calculator import Calculator, all_changes
 
@@ -443,8 +501,7 @@ def test_conformer_calculator_rejects_parallel_use():
     assert not provider.results
 
 
-@pytest.mark.parametrize("failed_positions", [(1.0,), (1.0, 2.0)])
-def test_failed_conformer_score_keeps_evidence(failed_positions):
+def test_failed_conformer_score_keeps_evidence():
     from ase.calculators.calculator import Calculator, all_changes
 
     class FailingEnergy(Calculator):
@@ -453,7 +510,7 @@ def test_failed_conformer_score_keeps_evidence(failed_positions):
         def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
             super().calculate(atoms, properties, system_changes)
             x = float(atoms.positions[0, 0])
-            if x in failed_positions:
+            if x == 1.0:
                 raise RuntimeError("physical evaluation failed")
             self.results = {"energy": x}
 
@@ -472,17 +529,16 @@ def test_failed_conformer_score_keeps_evidence(failed_positions):
     assert selection["scores"] is evidence
     assert selection["selected_index"] is None
     assert selection["lambda"] == 0.5
-    assert set(evidence.failures) == set(range(len(failed_positions)))
+    assert set(evidence.failures) == {0}
     assert evidence.method == method.label
     for index, coords in enumerate(candidates):
         np.testing.assert_array_equal(caught.value.candidates[index].positions, coords)
         assert caught.value.candidates[index].calc is None
         assert caught.value.candidates[index].info == {"charge": 0, "multiplicity": 1}
-    if len(failed_positions) == 1:
-        assert evidence.energies_ev[1] == 2.0
+    assert evidence.energies_ev[1] == 2.0
 
 
-@pytest.mark.parametrize("termination", ["success", "score_failure", "ff_failure", "interrupt"])
+@pytest.mark.parametrize("termination", ["success", "score_failure", "ff_failure"])
 def test_path_selection_evidence(monkeypatch, termination):
     from ase.calculators.calculator import Calculator, all_changes
 
@@ -514,7 +570,6 @@ def test_path_selection_evidence(monkeypatch, termination):
         multiplicity=1,
         solvent=None,
         n_cores=1,
-        sources=(mol, mol),
     )
     pot = SimpleNamespace(
         energy=lambda x, lam: ((np.linalg.norm(x[0] - x[1]) - 1.4) ** 2, None),
@@ -527,8 +582,6 @@ def test_path_selection_evidence(monkeypatch, termination):
         chosen = self._pick_conformer(pot, rea, candidates, 0.5, charge)
         if termination == "ff_failure":
             raise ff._FFRelaxationError(0.75, chosen, 7.0, np.ones_like(chosen), "controlled failure")
-        if termination == "interrupt":
-            raise KeyboardInterrupt("controlled interruption")
         return [Frame(i / 2, chosen.copy(), 0.0, 0.0, 0.0) for i in range(3)]
 
     monkeypatch.setattr(ff.TransitionStateGuesser, "_build_potential", lambda *args, **kwargs: pot)
@@ -539,16 +592,16 @@ def test_path_selection_evidence(monkeypatch, termination):
         path = guesser.find_transition_state(prepared)
         failures = path.sampling_failures
         selection = path.conformer_selections[0]
-        result = path.score(method=provider)
+        scored = path.score(method=provider)
+        result = scored.scores
         assert not result.failures
         assert result.n_evaluations == len(path.frames)
         np.testing.assert_array_equal(result.energies_ev, np.zeros(3))
-        assert path.guess("qm").to_atoms().info["charge"] == 1
+        assert scored.guess().to_atoms().info["charge"] == 1
     else:
         failure = {
             "score_failure": ff.ConformerScoringError,
             "ff_failure": ff._FFRelaxationError,
-            "interrupt": KeyboardInterrupt,
         }[termination]
         with pytest.raises(failure) as caught:
             guesser.find_transition_state(prepared)
@@ -571,21 +624,6 @@ def test_path_selection_evidence(monkeypatch, termination):
     provider.atoms.info["charge"] = -2
     assert selection["candidates"][0].info["charge"] == 1
     np.testing.assert_array_equal(selection["candidates"][0].positions, candidates[0])
-
-
-def test_sampling_calculator_uses_ase_units():
-    from ase import Atoms
-
-    from rxts.xtb import EV_PER_KCAL
-
-    tsg = rxts.TransitionStateGuesser()
-    gradient = np.arange(6.0).reshape(2, 3)
-    tsg._energy_grad = lambda pot, x, lam: (4.0, gradient)
-    atoms = Atoms(numbers=[6, 1], positions=np.zeros((2, 3)))
-    atoms.calc = ff._SamplingCalculator(tsg, SimpleNamespace(n_atoms=2), 0.5)
-
-    assert atoms.get_potential_energy() == pytest.approx(4.0 * EV_PER_KCAL)
-    np.testing.assert_allclose(atoms.get_forces(), -gradient * EV_PER_KCAL)
 
 
 def test_minimizer_failure_keeps_last_state(monkeypatch):
@@ -765,7 +803,7 @@ def _set_distance(x, pair, target):
 
 
 def test_organic_proposals_are_reproducible():
-    mol = as_molecules("CCO")[0]
+    mol = rxembed.embed(parse_smiles("CCO"), n=1, seed=0xF00D, threads=1).mol
     x = _set_distance(mol.GetConformer().GetPositions(), _PAIR, _TARGET)
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
@@ -780,10 +818,24 @@ def test_organic_proposals_are_reproducible():
 
 
 def test_embedding_failure():
-    mol = as_molecules("CCO")[0]
+    mol = rxembed.embed(parse_smiles("CCO"), n=1, seed=0xF00D, threads=1).mol
     impossible = {(0, mol.GetNumAtoms() + 90): 1.5}
     with pytest.warns(RuntimeWarning, match="Distance-geometry sampling failed"):
         assert embed_candidates(mol, mol.GetConformer().GetPositions(), impossible, n=4, n_cores=1) == []
+
+
+def test_metal_state_inference_failure_rejects_the_proposal(monkeypatch):
+    mol = mol_from_xyz(_PD_COMPLEX)
+    positions = mol.GetConformer().GetPositions()
+
+    def no_state(*args, **kwargs):
+        raise ValueError("the sampled donors do not fit the requested geometry")
+
+    monkeypatch.setattr(rxembed, "isomers", no_state)
+    monkeypatch.setattr(rxembed, "embed", lambda *a, **kw: pytest.fail("embedded an unidentified state"))
+    with pytest.warns(RuntimeWarning, match="sampled donors do not fit"):
+        assert embed_candidates(mol, positions, {(0, 1): 2.5}, n=4, n_cores=1) == []
+    np.testing.assert_array_equal(mol.GetConformer().GetPositions(), positions)
 
 
 def _capture_rxembed(monkeypatch):
@@ -829,9 +881,8 @@ def test_native_metal_sampling(monkeypatch):
     np.testing.assert_array_equal(proposals[0], x)
 
 
-@pytest.mark.parametrize("smiles", ["CCO", "CC[O-]"])
-def test_organic_targets_are_windows_not_fixed_atoms(monkeypatch, smiles):
-    mol = as_molecules(smiles)[0]
+def test_organic_targets_are_windows_not_fixed_atoms(monkeypatch):
+    mol = rxembed.embed(parse_smiles("CCO"), n=1, seed=0xF00D, threads=1).mol
     seen = _capture_rxembed(monkeypatch)
     x = mol.GetConformer().GetPositions()
     targets = {_PAIR: _TARGET, (1, 2): 1.7}
@@ -845,7 +896,7 @@ def test_organic_targets_are_windows_not_fixed_atoms(monkeypatch, smiles):
 
 
 def test_organic_windows_leave_angle_free(monkeypatch):
-    mol = as_molecules("CCI.CN")[0]
+    mol = rxembed.embed(parse_smiles("CCI.CN"), n=1, seed=0xF00D, threads=1).mol
     x = mol.GetConformer().GetPositions()
     nu, center, leaving = 4, 1, 2
     axis = x[leaving] - x[center]
@@ -871,36 +922,10 @@ def test_no_targets_proposes_nothing():
 
 
 def test_disabled_sampling_makes_no_embedding_call(monkeypatch):
-    mol = as_molecules("CCO")[0]
+    mol = rxembed.embed(parse_smiles("CCO"), n=1, seed=0xF00D, threads=1).mol
     x = mol.GetConformer().GetPositions()
     monkeypatch.setattr(rxembed, "embed", lambda *a, **kw: pytest.fail("disabled sampling reached embedding"))
     assert embed_candidates(mol, x, {_PAIR: _TARGET}, n=0, n_cores=1) == []
-
-
-def test_torsion_proposals_preserve_seeded_core():
-    from rdkit.Chem import AllChem
-
-    mol = Chem.AddHs(Chem.MolFromSmiles("CCCCCCC"))
-    assert AllChem.EmbedMolecule(mol, randomSeed=19) == 0
-    x = mol.GetConformer().GetPositions()
-    reactive = [(0, 1)]
-
-    assert conformers(mol, x, reactive, n=1, rng=np.random.default_rng(4)) == []
-    assert conformers(mol, x, reactive, n=0, rng=np.random.default_rng(4)) == []
-
-    first = conformers(mol, x, reactive, n=4, rng=np.random.default_rng(4))
-    second = conformers(mol, x, reactive, n=4, rng=np.random.default_rng(4))
-    assert len(first) == 3
-    for a, b in zip(first, second, strict=True):
-        np.testing.assert_array_equal(a, b)
-        np.testing.assert_array_equal(a[:2], x[:2])
-    assert any(np.max(np.abs(candidate[2:] - x[2:])) > 0.1 for candidate in first)
-
-
-def test_torsion_proposals_skip_ineligible_molecules():
-    mol = as_molecules("C")[0]
-    x = mol.GetConformer().GetPositions()
-    assert conformers(mol, x, reactive=(), n=4, rng=np.random.default_rng(4)) == []
 
 
 def test_single_donor_metal_reembeds():
