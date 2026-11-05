@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rxts"
-version = "0.1.0"
+version = "0.2.0"
 description = "VeloxChem-derived reaction mapping and force-field TS guesses"
 authors = [{name = "Alister S. Goodfellow"}]
 readme = "README.md"
