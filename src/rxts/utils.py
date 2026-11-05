@@ -6,7 +6,6 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from numbers import Integral
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -87,12 +86,7 @@ def mol_from_xyz(source, *, charge=0):
     import rxembed
 
     symbols, coords = read_xyz(source)
-    # rxembed currently accepts paths only; normalize literal and multi-frame XYZ here.
-    with TemporaryDirectory(prefix="rxts-endpoint-") as scratch:
-        path = Path(scratch) / "endpoint.xyz"
-        text = Path(source).read_text() if isinstance(source, Path) or "\n" not in str(source) else str(source)
-        path.write_text("\n".join(text.lstrip().splitlines()[: len(symbols) + 2]) + "\n")
-        out = rxembed.read_xyz(str(path), charge=charge, fallback=False)
+    out = rxembed.read_xyz(list(zip(symbols, coords, strict=True)), charge=charge, fallback=False)
     if [a.GetSymbol() for a in out.GetAtoms()] != symbols or not np.array_equal(
         out.GetConformer().GetPositions(), coords
     ):
