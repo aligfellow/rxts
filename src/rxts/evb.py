@@ -336,7 +336,6 @@ class _ReactionPotential:
         self.forming = sorted(forming)
         self.breaking = sorted(breaking)
         self.changing = sorted(set(forming) | set(breaking))
-        self.masses = np.array([a.GetMass() for a in rea.GetAtoms()])
         self.metal_angle_k = float(metal_angle_k)
         if metal_angle_references is None and self.metal_angle_k and pro is not None:
             rea_refs, rea_source = _endpoint_metal_angles(rea)
@@ -610,20 +609,6 @@ def _signed_dihedral(x, i, j, k, m):
         conformer.SetAtomPosition(index, x[atom].tolist())
     angle = rdMolTransforms.GetDihedralRad(conformer, 0, 1, 2, 3)
     return 0.0 if np.isnan(angle) else float(angle)
-
-
-def dihedral(x, i, j, k, m):
-    """Measure a torsion in radians, returning zero if either plane is collinear.
-
-    This shares `_COLLINEAR` with `torsion_gradient`. Active torsion selection and restraint energy
-    use `_signed_dihedral` without this floor.
-    """
-    x = np.asarray(x, dtype=float)
-    b1, b2, b3 = x[j] - x[i], x[k] - x[j], x[m] - x[k]
-    n1, n2 = np.cross(b1, b2), np.cross(b2, b3)
-    if np.linalg.norm(n1) < _COLLINEAR or np.linalg.norm(n2) < _COLLINEAR:
-        return 0.0
-    return _signed_dihedral(x, i, j, k, m)
 
 
 #: VeloxChem's value: 200 kJ/mol. Stiff enough to drag the torsion round against the barrier it

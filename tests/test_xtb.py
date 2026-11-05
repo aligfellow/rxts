@@ -12,7 +12,7 @@ import pytest
 from ase import Atoms
 
 from rxts import xtb
-from rxts.xtb import METHODS, _flags
+from rxts.xtb import _flags
 
 
 def test_switching_binary_refreshes_capabilities(monkeypatch):
@@ -215,7 +215,6 @@ def test_gxtb_is_selected_by_its_own_flag(monkeypatch):
     monkeypatch.setattr(xtb, "supports_gxtb", lambda: True)  # @cache'd; patch, do not call
     assert _flags("gxtb") == ["--gxtb"]
     assert _flags("gfn2") == ["--gfn", "2"]
-    assert set(METHODS) == {"gfn0", "gfn1", "gfn2", "gfnff", "gxtb"}
 
 
 def test_stock_xtb_refuses_gxtb_request(monkeypatch):

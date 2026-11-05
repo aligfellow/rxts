@@ -19,10 +19,6 @@ if TYPE_CHECKING:
 # Coordinate-perceived graphs are excluded from automatic MMFF typing.
 FROM_COORDINATES = "_rxts_from_coordinates"
 
-#: Selected endpoint coordinates are already placed; skip fragment approach and product derivation.
-PLACED = "_rxts_placed"
-
-
 # Transition metals handled by native coordination preparation.
 _TRANSITION_METALS = frozenset(range(21, 31)) | frozenset(range(39, 49)) | {57, 71} | frozenset(range(72, 81))
 _BOND_SCALE = 1.2  # bonded below this multiple of the summed covalent radii
@@ -244,36 +240,6 @@ def describe(mol, internals):
     """Name an internal coordinate by its atom symbols and indices."""
     sym = [a.GetSymbol() for a in mol.GetAtoms()]
     return "-".join(f"{sym[i]}{i}" for i in internals)
-
-
-def _graph_identity(mol):
-    """Chemical identity in current atom order, including isotopes and declared stereo."""
-    atoms = tuple(
-        (
-            a.GetAtomicNum(),
-            a.GetIsotope(),
-            a.GetFormalCharge(),
-            a.GetNumRadicalElectrons(),
-            a.GetAtomMapNum(),
-            a.GetChiralTag(),
-        )
-        for a in mol.GetAtoms()
-    )
-    bonds = tuple(
-        sorted(
-            (
-                b.GetBeginAtomIdx(),
-                b.GetEndAtomIdx(),
-                b.GetBondType(),
-                b.GetIsAromatic(),
-                b.GetBondDir(),
-                b.GetStereo(),
-                tuple(b.GetStereoAtoms()),
-            )
-            for b in mol.GetBonds()
-        )
-    )
-    return atoms, bonds
 
 
 def default_cores():
