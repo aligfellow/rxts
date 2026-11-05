@@ -1,45 +1,34 @@
-"""Compatible endpoint geometry construction.
-
-rxembed supplies molecular embeddings and minimum graphs. Reactive-complex restraints follow
-VeloxChem's ReactionForceFieldBuilder; attack-face search and topology checks belong here.
-"""
+"""Coembed selected endpoint species, or reuse an explicit rxembed pair batch."""
 
 from __future__ import annotations
 
 import logging
-import warnings
 from dataclasses import dataclass, field
+from numbers import Integral
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import rxembed
 from rdkit import Chem
-from rdkit.Chem import rdForceFieldHelpers
 
 from rxts.mapping import (
     _normalise_pairs,
     _select_mapping,
     _validate_bonds,
-    bond_set,
     invert,
-    parse_smiles,
     reaction_bonds,
     split_reaction_smiles,
 )
 from rxts.structure import Geometry
 from rxts.utils import (
     FROM_COORDINATES,
-    PLACED,
-    _align,
-    _graph_identity,
     _validate_declared_context,
+    _worker_count,
     describe,
     is_xyz_file,
     metal_atoms,
     mol_from_xyz,
-    require_topology,
-    set_positions,
     validate_cores,
     with_conformer,
 )
@@ -49,327 +38,7 @@ if TYPE_CHECKING:
 
     from ase import Atoms
 
-_FRAGMENT_GAP = 2.0  # A of empty space between fragments before they are pulled in
-_CONTACT_SLACK = 0.5  # A beyond the vdW minimum still counts as "touching" (VeloxChem's value)
-_CONTACT_K = 100.0  # kcal/mol/A^2 pulling reactive atoms into contact
-_CONTACT_ATTEMPTS = 5  # retries, each loosening the flat-bottom slack, before giving up
-# Soft Cartesian holds let the product topology relax without wholesale reorientation.
-_PIN_K = 5.0
-_PIN_K_SOFT = 1.0
-_DEGENERATE = 1e-6  # a bond vector this short has no direction
-
 logger = logging.getLogger(__name__)
-
-
-def _native_conformer(result, expected=None):
-    """Validate and return the one relaxed conformer of an rxembed result."""
-    if len(result.ids) != 1:
-        raise ValueError("rxembed must return exactly one selected conformer")
-    if result.unrelaxed:
-        raise ValueError("rxembed returned an unrelaxed conformer; converge its native cleanup first")
-
-    mol = result.mol
-    if expected is not None and _graph_identity(mol) != _graph_identity(expected):
-        raise ValueError("rxembed changed the selected topology, atom maps or electronic state")
-    if mol.GetNumConformers() != 1 or not np.isfinite(mol.GetConformer().GetPositions()).all():
-        raise ValueError("rxembed returned nonfinite or multiple conformers")
-    return mol
-
-
-def as_molecules(spec, seed=0xF00D):
-    """Embed SMILES/RDKit inputs or copy coordinate-bearing molecules."""
-    if not isinstance(spec, (list, tuple)):
-        spec = [spec]
-    out = []
-    for item in spec:
-        if isinstance(item, str):
-            mol = parse_smiles(item)
-        elif isinstance(item, Chem.Mol):
-            mol = Chem.Mol(item)
-            if mol.GetNumConformers():
-                out.append(mol)
-                continue
-            mol = Chem.AddHs(mol)
-        else:
-            raise TypeError(f"Expected a SMILES string or an RDKit Mol, got {type(item)}")
-        result = rxembed.embed(mol, n=1, seed=int(seed), threads=1)
-        out.append(_native_conformer(result, mol))
-    return out
-
-
-def combine_spaced(mols):
-    """Merge fragments into one molecule, spaced out so nothing overlaps.
-
-    Fragments are laid end to end along x. The gap is arbitrary; the reactive
-    complex step then pulls them back together into a real geometry.
-    """
-    combined = None
-    for original in mols:
-        mol = Chem.Mol(original)
-        conf = mol.GetConformer()
-        pos = conf.GetPositions()
-        if combined is None:
-            shift = -pos[:, 0].min()
-        else:
-            prev = combined.GetConformer().GetPositions()
-            shift = prev[:, 0].max() - pos[:, 0].min() + _FRAGMENT_GAP
-        for i in range(mol.GetNumAtoms()):
-            p = pos[i] + np.array([shift, 0.0, 0.0])
-            conf.SetAtomPosition(i, p.tolist())
-        combined = mol if combined is None else Chem.CombineMols(combined, mol)
-    Chem.SanitizeMol(combined)
-    return combined
-
-
-def rdkit_minimiser(mol):
-    """Build a minimiser for `mol`: MMFF94 where it types, UFF where it does not.
-
-    UFF is needed because it types `[I-]`, which MMFF refuses.
-
-    :return: (force field, "mmff" | "uff").
-    """
-    props = rdForceFieldHelpers.MMFFGetMoleculeProperties(mol)
-    if props is not None:
-        ff = rdForceFieldHelpers.MMFFGetMoleculeForceField(
-            mol, props, nonBondedThresh=1e5, ignoreInterfragInteractions=False
-        )
-        if ff is not None:
-            return ff, "mmff"
-
-    ff = rdForceFieldHelpers.UFFGetMoleculeForceField(mol, ignoreInterfragInteractions=False)
-    if ff is None:
-        raise ValueError(
-            "Neither MMFF94 nor UFF can type this molecule, so there is nothing to "
-            "build a starting geometry with. Select a native rxembed isomer with a named "
-            "coordination geometry, or supply endpoint XYZ structures."
-        )
-    return ff, "uff"
-
-
-def _contact_distance(mol, i, j):
-    """Compute how far apart two atoms are when just touching.
-
-    MMFF's R*_ij where MMFF can type the molecule (VeloxChem's choice); a sum of van der Waals radii is
-    not equivalent and is only the fallback for elements MMFF cannot type.
-    """
-    props = rdForceFieldHelpers.MMFFGetMoleculeProperties(mol)
-    if props is not None:
-        return props.GetMMFFVdWParams(i, j)[2]
-    table = Chem.GetPeriodicTable()
-    return table.GetRvdw(mol.GetAtomWithIdx(i).GetAtomicNum()) + table.GetRvdw(mol.GetAtomWithIdx(j).GetAtomicNum())
-
-
-#: Approach directions to try, spread evenly on a sphere by a Fibonacci lattice.
-#: Deterministic, and each candidate costs one force-field energy.
-_APPROACH_DIRECTIONS = 24
-#: Axial orientations sampled for a rigid incoming fragment.
-_APPROACH_SPINS = 4
-
-
-def _approach_directions():
-    """Evenly spread unit vectors on a sphere (Fibonacci lattice)."""
-    i = np.arange(_APPROACH_DIRECTIONS) + 0.5
-    phi = np.arccos(1.0 - 2.0 * i / _APPROACH_DIRECTIONS)
-    theta = np.pi * (1.0 + 5.0**0.5) * i
-    return np.c_[np.cos(theta) * np.sin(phi), np.sin(theta) * np.sin(phi), np.cos(phi)]
-
-
-def _rotation_about(axis, angle):
-    """Rotate through `angle` about a unit direction."""
-    axis = np.asarray(axis, dtype=float)
-    norm = float(np.linalg.norm(axis))
-    if norm <= _DEGENERATE:
-        raise ValueError("A rotation axis needs a direction.")
-    x, y, z = axis / norm
-    cross = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
-    return np.eye(3) + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
-
-
-def _rotation_onto(source, target):
-    """Build the shortest rotation taking `source` onto `target`."""
-    source = np.asarray(source, dtype=float)
-    target = np.asarray(target, dtype=float)
-    source /= np.linalg.norm(source)
-    target /= np.linalg.norm(target)
-    axis = np.cross(source, target)
-    sine = float(np.linalg.norm(axis))
-    cosine = float(np.clip(source @ target, -1.0, 1.0))
-    if sine <= _DEGENERATE:
-        if cosine > 0.0:
-            return np.eye(3)
-        basis = np.eye(3)[int(np.argmin(np.abs(source)))]
-        return _rotation_about(np.cross(source, basis), np.pi)
-    cross = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
-    return np.eye(3) + cross + (cross @ cross) * ((1.0 - cosine) / sine**2)
-
-
-def _lone_pair_axis(mol, atom):
-    """Point from an atom's neighbour centroid through the atom, or return `None` if undefined."""
-    neighbours = [neighbour.GetIdx() for neighbour in mol.GetAtomWithIdx(int(atom)).GetNeighbors()]
-    if not neighbours:
-        return None
-    positions = np.asarray(mol.GetConformer().GetPositions(), dtype=float)
-    axis = positions[int(atom)] - positions[neighbours].mean(axis=0)
-    norm = float(np.linalg.norm(axis))
-    return None if norm <= _DEGENERATE else axis / norm
-
-
-def _place_fragment(positions, fragment, arriving, rotation, target):
-    """Rigidly place `fragment` with `arriving` exactly at `target`."""
-    return (positions[fragment] - positions[int(arriving)]) @ rotation.T + target
-
-
-def search_approach(mol, forming, breaking, energy):
-    """Place one incoming fragment by sampling approach directions and axial rotations.
-
-    Rank sphere and leaving-group-opposite proposals with the supplied charged FF energy.
-    Intramolecular and multiple-contact reactions retain their placement; an eligible search
-    without a charged potential warns and retains its original coordinates."""
-    # An "incoming" atom forms a bond to a centre simultaneously breaking one -- the SN2 pattern.
-    incoming: dict[int, int] = {}  # arriving atom -> the centre it attacks
-    for a, c in forming:
-        for centre, arriving in ((a, c), (c, a)):
-            for pair in breaking:
-                if centre in pair and arriving not in pair:
-                    incoming.setdefault(arriving, centre)
-
-    if len(incoming) != 1:
-        return mol
-
-    conf = mol.GetConformer()
-    x0 = np.asarray(conf.GetPositions(), dtype=float)
-    arriving, centre = next(iter(incoming.items()))
-    fragment = np.asarray(next(part for part in Chem.GetMolFrags(mol) if arriving in part), dtype=int)
-    if centre in fragment:
-        return mol
-    if energy is None:
-        warnings.warn(
-            "Attack-face search has no charged force field; install rxts[ff] or supply endpoint XYZ structures.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return mol
-
-    reach = _contact_distance(mol, int(arriving), int(centre)) + _CONTACT_SLACK
-    candidates = list(_approach_directions())
-    # ...and the direction anti to every bond this centre is breaking; offered, not imposed.
-    for pair in breaking:
-        if centre not in pair:
-            continue
-        leaving = pair[0] if pair[1] == centre else pair[1]
-        away = x0[centre] - x0[leaving]
-        norm = np.linalg.norm(away)
-        if norm > _DEGENERATE:
-            candidates.append(away / norm)
-
-    axis = _lone_pair_axis(mol, arriving)
-    best, best_energy = None, np.inf
-    for direction in candidates:
-        target = x0[centre] + reach * direction
-        rotations = (np.eye(3),)
-        if axis is not None:
-            aligned = _rotation_onto(axis, -direction)
-            rotations = tuple(
-                _rotation_about(direction, 2.0 * np.pi * spin / _APPROACH_SPINS) @ aligned
-                for spin in range(_APPROACH_SPINS)
-            )
-        for rotation in rotations:
-            placed = _place_fragment(x0, fragment, arriving, rotation, target)
-            x = x0.copy()
-            x[fragment] = placed
-            try:
-                candidate_energy, _ = energy(x)
-                candidate_energy = float(candidate_energy)
-            except Exception:
-                continue
-            if np.isfinite(candidate_energy) and candidate_energy < best_energy:
-                best, best_energy = placed, candidate_energy
-
-    if best is not None:
-        for atom, position in zip(fragment, best, strict=True):
-            conf.SetAtomPosition(int(atom), position.tolist())
-
-    return mol
-
-
-def reactive_complex(mol, contact_pairs):
-    """Relax the reactive complex with flat-bottom restraints on approaching atom pairs.
-
-    Exhausted relaxation warns and retains provisional coordinates."""
-    if not contact_pairs:
-        ff, _ = rdkit_minimiser(mol)
-        ff.Initialize()
-        if ff.Minimize(maxIts=2000) != 0:
-            warnings.warn(
-                "Initial force-field relaxation did not converge; coordinates remain provisional.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        return mol
-
-    for attempt in range(_CONTACT_ATTEMPTS):
-        ff, _ = rdkit_minimiser(mol)
-        slack = _CONTACT_SLACK + attempt * 0.5
-        for i, j in contact_pairs:
-            ff.AddDistanceConstraint(int(i), int(j), 0.0, _contact_distance(mol, int(i), int(j)) + slack, _CONTACT_K)
-        ff.Initialize()
-        if ff.Minimize(maxIts=2000, forceTol=1e-4) == 0:
-            return mol
-    warnings.warn(
-        "Contact relaxation exhausted its attempts; coordinates remain provisional.", RuntimeWarning, stacklevel=2
-    )
-    return mol
-
-
-def derive_product_geometry(reactant, product, forming, breaking):
-    """Relax the product topology in the reactant frame with soft Cartesian holds.
-
-    Try progressively weaker spectator holds if the bonding is wrong. Valid but unconverged
-    cleanup warns; failure to obtain the product bonding raises."""
-    intended = bond_set(product)
-    reactive = {int(a) for pair in list(forming) + list(breaking) for a in pair}
-    spectators = [i for i in range(product.GetNumAtoms()) if i not in reactive]
-
-    # Hold everything first; if the reactive core cannot then reach its new bonding,
-    # hold only the spectators and let the core move freely.
-    ladder = [
-        (range(product.GetNumAtoms()), _PIN_K),
-        (spectators, _PIN_K),
-        (spectators, _PIN_K_SOFT),
-    ]
-
-    failures = []
-    for held, k in ladder:
-        target = Chem.Mol(product)
-        conf = target.GetConformer()
-        source = reactant.GetConformer().GetPositions()
-        for i in range(target.GetNumAtoms()):  # seed all atoms in R's frame
-            conf.SetAtomPosition(i, source[i].tolist())
-
-        ff, kind = rdkit_minimiser(target)
-        # Pin each held atom near where it already is, with a soft constraint.
-        pin = ff.MMFFAddPositionConstraint if kind == "mmff" else ff.UFFAddPositionConstraint
-        for i in held:
-            pin(int(i), 0, k)
-        ff.Initialize()
-        status = ff.Minimize(maxIts=2000, forceTol=1e-4)
-
-        try:
-            require_topology(target, intended, "derived product")
-        except ValueError as exc:
-            failures.append(str(exc).splitlines()[1])  # the first "missing/spurious bonds" line
-            continue
-        if status != 0:
-            warnings.warn(
-                "Product force-field cleanup did not converge; its bonding is valid but coordinates are provisional.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        return target
-
-    raise ValueError(
-        "Could not derive a product geometry with the product's bonding.\n" + "\n".join(f"  {f}" for f in failures)
-    )
 
 
 def _metal_identity(species, product_mapping=None):
@@ -411,7 +80,8 @@ def _metal_identity(species, product_mapping=None):
 class PreparedReaction:
     """Mapped endpoints in reactant atom order, ready for FF interpolation.
 
-    Native sources and selected species retain their original index spaces and identities."""
+    Conformer positions pair the two endpoints; the first pair defines the frozen FF fields.
+    Selected metal species keep their own atom order; `mapping` takes the product's to the reactant's."""
 
     reactant: Chem.Mol
     product: Chem.Mol
@@ -422,13 +92,12 @@ class PreparedReaction:
     multiplicity: int
     solvent: str | None
     n_cores: int | None
-    sources: tuple[object, object] = field(repr=False)
     native_states: tuple[Chem.Mol | None, Chem.Mol | None] = field(default=(None, None), repr=False)
     endpoint_identity: tuple[dict | None, dict | None] = (None, None)
 
     @property
     def endpoints(self) -> tuple[Atoms, ...]:
-        """Return independent ASE endpoints with declared reaction and source identity metadata."""
+        """Return the first pair as independent ASE endpoints with reaction and source identity metadata."""
         return tuple(
             Geometry(
                 mol=mol,
@@ -447,11 +116,6 @@ class PreparedReaction:
         )
 
 
-def _geometry_known(spec):
-    """Recognise placed XYZ or selected rxembed endpoints, which bypass approach and product derivation."""
-    return bool(_is_xyz_input(spec) or (isinstance(spec, Chem.Mol) and spec.HasProp(PLACED)))
-
-
 def _check_same_atoms(rea, pro):
     """Require both endpoints to contain the same elements and atom counts."""
     left = sorted(a.GetSymbol() for a in rea.GetAtoms())
@@ -464,27 +128,33 @@ def _check_same_atoms(rea, pro):
 
 
 def _declared_endpoint(spec, charge=None):
-    """Read topology and declared charge before embedding."""
+    """Read each declared graph in fragment order, with every hydrogen explicit.
+
+    Fragment lists use the parsed graphs, including CX stereo, and discard conformers on copies. A complete Mol
+    keeps its conformer, and hydrogens it leaves implicit are placed on it.
+    """
     if _is_xyz_input(spec):
         mol = Chem.Mol(spec) if isinstance(spec, Chem.Mol) else mol_from_xyz(spec, charge=charge)
         return None, mol
-    if isinstance(spec, Chem.Mol):
-        mols = [Chem.AddHs(spec) if not spec.GetNumConformers() else Chem.Mol(spec)]
-    elif isinstance(spec, (list, tuple)):
-        mols = []
-        for part in spec:
-            if isinstance(part, Chem.Mol):
-                mols.append(Chem.AddHs(part) if not part.GetNumConformers() else part)
-            else:
-                mols.append(parse_smiles(part))
-    elif isinstance(spec, (str, Path)):
-        mols = [parse_smiles(spec)]
-    else:
-        raise TypeError("Expected reaction SMILES, RDKit molecules or XYZ files")
+    fragments = isinstance(spec, (list, tuple))
+    mols = []
+    for part in spec if fragments else [spec]:
+        if isinstance(part, Chem.Mol):
+            if fragments and metal_atoms(part):
+                raise ValueError("Native metal preparation requires one combined molecule or selected species")
+            mol = Chem.Mol(part)
+        elif isinstance(part, str):
+            mol = rxembed.parse_smiles(part, remove_hs=False)
+        else:
+            raise TypeError("Expected reaction SMILES, RDKit molecules or XYZ files")
+        if fragments:
+            mol.RemoveAllConformers()
+        mols.append(Chem.AddHs(mol, addCoords=bool(mol.GetNumConformers())))
     charge = sum(atom.GetFormalCharge() for mol in mols for atom in mol.GetAtoms())
-    graph = Chem.Mol(mols[0])
+    graph = mols[0]
     for fragment in mols[1:]:
         graph = Chem.CombineMols(graph, fragment)
+    Chem.GetSymmSSSR(graph)
     return charge, graph
 
 
@@ -498,107 +168,28 @@ def _is_xyz_input(spec):
     )
 
 
-def _charged_potential(mol, charge, solvent):
-    """Evaluate the attack-face construction energy with GFN-FF electrostatics."""
-    from rxts.gfnff import GFNFF
+def select_metal_state(graph, geometry=None):
+    """Select the one metal species a declared `graph` can be, in its atom order; None without a metal.
 
-    try:
-        return GFNFF(mol, charge=charge, solvent=solvent).energy_grad
-    except (RuntimeError, OSError, ImportError):
-        return None
-
-
-def selected_endpoint(spec, expected=None):
-    """Read one selected native conformer and mark its geometry as supplied."""
-    if (
-        isinstance(spec, Chem.Mol)
-        and spec.GetNumConformers()
-        and not np.isfinite(spec.GetConformer().GetPositions()).all()
-    ):
-        raise ValueError("The selected endpoint has nonfinite coordinates")
-    if isinstance(spec, (str, Path, Chem.Mol)) or type(spec) in (list, tuple):
-        return spec
-    mol = _native_conformer(spec, expected)
-    mol.SetBoolProp(PLACED, True)
-    return mol
-
-
-def select_metal_state(spec, geometry=None):
-    """Select one native metal species; geometry names select a shape only.
-
-    Return ``(species, endpoint, requested)``. A metal Mol whose conformer states its arrangement in atom notes,
-    such as an rxembed result's ``.mol``, is placed: its coordinates are kept. Any other metal input is read by
-    `rxembed.isomers` and must be one species. CX labels and selected species retain their source indexing.
+    A conformer establishes the species but is not kept; a geometry name selects a shape only. Several fitting
+    species raise rather than choose.
     """
-    original = spec
-    if isinstance(spec, (list, tuple)) and all(isinstance(part, str) for part in spec):
-        spec = ".".join(spec)
-    graph = spec
-    if isinstance(spec, str) and not _is_xyz_input(spec):
-        graph = Chem.MolFromSmiles(spec)
-    if not isinstance(graph, Chem.Mol):
-        if isinstance(spec, (list, tuple)) and any(isinstance(part, Chem.Mol) and metal_atoms(part) for part in spec):
-            raise ValueError("Native metal preparation requires one combined molecule or selected species")
-        if geometry is not None:
-            raise ValueError("Endpoint geometry requires one metal molecule or selected species")
-        return None, original, False
-    if not metal_atoms(graph):
+    metals = metal_atoms(graph)
+    if not metals:
         if geometry is not None:
             raise ValueError("Endpoint geometry requires a metal coordination state")
-        return None, original, False
-    if geometry is None and graph.HasProp(PLACED):
-        return None, original, False
-
-    # Native parsing binds donor notes to their bonds before AddHs appends atoms. RDKit's
-    # ordinary parser loses coordinated ligand tags, so it is used only for metal detection.
-    if isinstance(spec, str):
-        graph = rxembed.parse_smiles(spec, remove_hs=False)
-    if graph.GetNumConformers() > 1:
-        raise ValueError("Select exactly one conformer of a metal endpoint before preparing the reaction")
-    observed = graph.GetNumConformers() == 1
-    graph = Chem.AddHs(graph, addCoords=observed)
-    metals = metal_atoms(graph)
+        return None
+    observed = bool(graph.GetNumConformers())
     stated = all(graph.GetAtomWithIdx(m).HasProp("atomNote") for m in metals)
     if geometry is None and not (stated or observed):
         raise ValueError("Coordinate-free metal endpoints need geometry= or a selected species or CX state")
-    found = rxembed.isomers(graph, geometry=geometry, center="all" if len(metals) > 1 else None, observed=observed)
+    found = rxembed.isomers(graph, geometry=geometry, observed=observed)
     if len(found) > 1:
         labels = ", ".join(
             "/".join(filter(None, rxembed.identity(state).labels)) or f"#{k}" for k, state in enumerate(found)
         )
         raise ValueError(f"{len(found)} isomers fit ({labels}); pass one from rxembed.isomers(...).select(...)")
-    species = found.select()
-    if geometry is not None:
-        for state in rxembed.identity(species).centres:
-            found.select(geometry=geometry, center=state.atom)
-    if observed and stated and geometry is None:
-        graph = selected_endpoint(graph)
-        graph.SetBoolProp(PLACED, True)
-        return species, graph, False
-    return species, graph, True
-
-
-def relax_metal_endpoint(species, reactant, mapping):
-    """Relax a native species from the mapped endpoint seed; the caller's species is unchanged."""
-    reference = reactant.GetConformer().GetPositions()[mapping]
-    if not np.isfinite(reference).all():
-        raise ValueError("The native endpoint seed has nonfinite coordinates")
-    seeded = with_conformer(species, reference)
-    product = selected_endpoint(rxembed.minimize(seeded), seeded)
-    if [a.GetAtomicNum() for a in product.GetAtoms()] != [
-        reactant.GetAtomWithIdx(int(r)).GetAtomicNum() for r in mapping
-    ]:
-        raise ValueError("Native endpoint cleanup changed the mapped endpoint atoms")
-    return set_positions(product, _align(product.GetConformer().GetPositions(), reference))
-
-
-def _graph_only(spec):
-    """Whether rxts must build this endpoint's geometry: SMILES, or a Mol without coordinates."""
-    if isinstance(spec, (list, tuple)):
-        return all(_graph_only(part) for part in spec)
-    if isinstance(spec, str):
-        return not _is_xyz_input(spec)
-    return isinstance(spec, Chem.Mol) and not spec.GetNumConformers()
+    return found.select()
 
 
 def _mapped(mol, maps):
@@ -610,31 +201,33 @@ def _mapped(mol, maps):
     return out
 
 
-def _coembed_endpoints(sides, mapping, seed):
-    """Embed both endpoints as one tied rxembed system and return them in the reactant's atom order.
-
-    `sides` are each endpoint's selected species, or its graph when it has no metal, in its own atom order. Atom
-    maps carry rxts's mapping through rxembed (reactant atom r is r + 1; product atom p is mapping[p] + 1), and
-    every returned atom keeps its map, so ordering by map restores the reactant's order.
-    """
+def _coembed_endpoints(sides, mapping, maps, seed, n_conformers, n_cores):
+    """Sample paired conformers of the selected species in reactant atom order, carrying the caller's `maps`."""
     n = len(mapping)
     sides = (_mapped(sides[0], range(1, n + 1)), _mapped(sides[1], [r + 1 for r in mapping]))
-    pair = rxembed.coembed(sides, n=1, seed=seed, threads=1)
-    if not len(pair):
+    pairs = rxembed.coembed(sides, n=n_conformers, seed=seed, threads=_worker_count(n_conformers, n_cores))
+    return tuple(_mapped(mol, maps) for mol in _paired_endpoints(pairs))
+
+
+def _paired_endpoints(pairs):
+    """Return both endpoints of a coembedded batch; conformer k of one pairs with conformer k of the other."""
+    if not pairs.ids:  # `ids` also refuses a batch whose endpoints were selected apart
         raise ValueError("rxembed co-embedded no pair of these endpoints; check that each side embeds alone")
-    paired = []
-    for ensemble in (pair.reactant, pair.product):
-        mol = selected_endpoint(ensemble)
-        order = sorted(range(n), key=lambda i: mol.GetAtomWithIdx(i).GetAtomMapNum())
-        paired.append(Chem.RenumberAtoms(mol, order))
-    return paired
+    endpoints = pairs.reactant.mol, pairs.product.mol
+    for mol in endpoints:
+        for k, conf in enumerate(mol.GetConformers()):  # pair k is conformer k of both
+            if not np.isfinite(conf.GetPositions()).all():
+                raise ValueError("The coembedded batch has nonfinite coordinates")
+            conf.SetId(k)
+    return endpoints
 
 
 def prepare_endpoints(
-    reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol],
+    reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | rxembed.Coembedded,
     product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | None = None,
     *,
     seed: int = 0xF00D,
+    n_conformers: int = 1,
     forming_bonds: list[tuple[int, int]] | None = None,
     breaking_bonds: list[tuple[int, int]] | None = None,
     mapping: list[int] | None = None,
@@ -645,17 +238,32 @@ def prepare_endpoints(
     solvent: str | None = None,
     n_cores: int | None = None,
 ) -> PreparedReaction:
-    """Map endpoints and prepare matching graphs and coordinates without scanning or QM.
+    """Map endpoint inputs, or attach reaction metadata to a coembedded batch.
 
-    Endpoints without coordinates, including selected rxembed species, are embedded together as one tied rxembed
-    system in the reactant's atom order. Placed conformers retain their coordinates, and native sources keep their
-    original atom order.
+    Endpoint inputs request `n_conformers` coembedded pairs in the reactant's atom order;
+    fewer pairs may pass rxembed's gates. Coordinates can establish the selected isomer but are not held fixed.
+    Geometry names select coordination shapes; coembedding constructs and relaxes both endpoints together.
+    Fragment lists contribute graphs; their conformers are discarded on copies before construction.
+    A native `Coembedded` batch supplies its own pair count and shared atom order without re-embedding.
     """
     _validate_declared_context(charge, multiplicity)
     if multiplicity is None:
         raise ValueError("prepare_endpoints requires a declared multiplicity; pass multiplicity=...")
     if n_cores is not None:
         validate_cores(n_cores)
+    if isinstance(n_conformers, bool) or not isinstance(n_conformers, Integral) or n_conformers < 1:
+        raise ValueError("n_conformers must be an int >= 1")
+
+    supplied_pairs = None
+    if isinstance(reactant, rxembed.Coembedded):
+        if product is not None:
+            raise ValueError("A coembedded result already contains both endpoints; omit product")
+        supplied_pairs = _paired_endpoints(reactant)
+        identity = list(range(supplied_pairs[0].GetNumAtoms()))
+        if mapping is not None and list(mapping) != identity:
+            raise ValueError("Coembedded endpoints already share atom order; omit mapping")
+        mapping = identity
+        reactant, product = (with_conformer(mol, mol.GetConformer().GetPositions()) for mol in supplied_pairs)
 
     if product is None:
         split = split_reaction_smiles(reactant)
@@ -666,7 +274,6 @@ def prepare_endpoints(
             )
         reactant, product = split
 
-    sources = (reactant, product)
     reactant_xyz, product_xyz = _is_xyz_input(reactant), _is_xyz_input(product)
     if reactant_xyz != product_xyz:
         raise ValueError("Supply both endpoints as XYZ, or read them as RDKit/rxembed molecules before preparation")
@@ -674,6 +281,9 @@ def prepare_endpoints(
         raise ValueError("XYZ endpoints do not declare charge; pass charge=...")
     reactant_charge, reactant_graph = _declared_endpoint(reactant, charge)
     product_charge, product_graph = _declared_endpoint(product, charge)
+    for graph in (reactant_graph, product_graph):
+        if any(not np.isfinite(conf.GetPositions()).all() for conf in graph.GetConformers()):
+            raise ValueError("Endpoint has nonfinite coordinates")
     declared_charges = [value for value in (reactant_charge, product_charge) if value is not None]
     if len(set(declared_charges)) > 1:
         raise ValueError(f"Reactant and product formal charges differ ({reactant_charge:+d} and {product_charge:+d})")
@@ -693,52 +303,14 @@ def prepare_endpoints(
     mapping = _select_mapping(reactant_graph, product_graph, mapping, forming_bonds, breaking_bonds)
     _validate_bonds(reactant_graph, Chem.RenumberAtoms(product_graph, invert(mapping)), forming_bonds, breaking_bonds)
 
-    rea_state, reactant, rea_request = select_metal_state(reactant, reactant_geometry)
-    pro_state, product, pro_request = select_metal_state(product, product_geometry)
-    native_pair = rea_request or pro_request
-    paired = None
-    if _graph_only(reactant) and _graph_only(product):
-        sides = tuple(
-            graph if state is None else state
-            for state, graph in ((rea_state, reactant_graph), (pro_state, product_graph))
-        )
-        paired = _coembed_endpoints(sides, mapping, seed)
-        for mol in paired:  # the caller's own maps, in the reactant's order
-            for atom, source in zip(mol.GetAtoms(), reactant_graph.GetAtoms(), strict=True):
-                atom.SetAtomMapNum(source.GetAtomMapNum())
-    if paired is not None:
-        rea, pro = paired
-    elif native_pair:
-        if rea_state is None or pro_state is None:
-            raise ValueError("Native paired preparation requires a selected coordination state at both endpoints")
-        if not reactant.GetNumConformers():
-            reactant = selected_endpoint(rxembed.embed(rea_state, n=1, seed=seed, threads=1), reactant)
-        elif rea_request:
-            reactant = relax_metal_endpoint(rea_state, reactant, list(range(reactant.GetNumAtoms())))
-        else:
-            reactant = Chem.Mol(reactant)
-        rea = reactant_graph if reactant_xyz else reactant
-        pro = relax_metal_endpoint(pro_state, rea, mapping)
+    rea_state = select_metal_state(reactant_graph, reactant_geometry)
+    pro_state = select_metal_state(product_graph, product_geometry)
+    if supplied_pairs is None:
+        sides = [reactant_graph if rea_state is None else rea_state, product_graph if pro_state is None else pro_state]
+        maps = [atom.GetAtomMapNum() for atom in reactant_graph.GetAtoms()]
+        rea, pro = _coembed_endpoints(sides, mapping, maps, seed, n_conformers, n_cores)
     else:
-        reactant = selected_endpoint(reactant)
-        product = selected_endpoint(product)
-        if reactant_xyz:
-            rea, pro = reactant_graph, product_graph
-        else:
-            rea = (
-                Chem.Mol(reactant)
-                if isinstance(reactant, Chem.Mol) and _geometry_known(reactant)
-                else combine_spaced(as_molecules(reactant, seed=seed))
-            )
-            pro = (
-                Chem.Mol(product)
-                if isinstance(product, Chem.Mol) and _geometry_known(product)
-                else combine_spaced(as_molecules(product, seed=seed))
-            )
-
-    if paired is None:
-        # Keep product atoms and coordinates in the reactant's index space.
-        pro = Chem.RenumberAtoms(pro, invert(mapping))
+        rea, pro = supplied_pairs
     forming, breaking = reaction_bonds(rea, pro, list(range(rea.GetNumAtoms())))
     if forming_bonds is not None:
         forming = {tuple(sorted(p)) for p in forming_bonds}
@@ -754,17 +326,6 @@ def prepare_endpoints(
     for pair in sorted(forming):
         logger.info(f"  forming   {describe(rea, pair)}")
 
-    if paired is None and not native_pair and (not _geometry_known(reactant) or not _geometry_known(product)):
-        # Choose the attack face before contact relaxation; later distance restraints do not set it.
-        rea = search_approach(
-            mol=rea,
-            forming=sorted(forming),
-            breaking=sorted(breaking),
-            energy=_charged_potential(rea, charge, solvent),
-        )
-        rea = reactive_complex(rea, sorted(forming))
-        pro = derive_product_geometry(reactant=rea, product=pro, forming=forming, breaking=breaking)
-
     return PreparedReaction(
         reactant=rea,
         product=pro,
@@ -775,7 +336,6 @@ def prepare_endpoints(
         multiplicity=multiplicity,
         solvent=solvent,
         n_cores=n_cores,
-        sources=sources,
         native_states=(rea_state, pro_state),
         endpoint_identity=(_metal_identity(rea_state), _metal_identity(pro_state, mapping)),
     )

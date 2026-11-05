@@ -14,7 +14,7 @@ from rxts.draw import (
 from rxts.ff import TransitionStateGuesser, set_verbose
 from rxts.mapping import Mechanism, map_reaction, map_smiles, mechanisms
 from rxts.scoring import CalculatorMethod, ScoreResult
-from rxts.structure import Geometry, ReactionPath
+from rxts.structure import Geometry, ReactionPath, ReactionPaths
 from rxts.xtb import set_xtb
 
 try:
@@ -28,6 +28,7 @@ __all__ = [
     "Mechanism",
     "PreparedReaction",
     "ReactionPath",
+    "ReactionPaths",
     "ScoreResult",
     "TransitionStateGuesser",
     "bond_data",

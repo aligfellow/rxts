@@ -22,7 +22,7 @@ def main() -> None:
     )
     parser.add_argument("-o", "--prefix", default="ts", help="output file prefix (default: ts)")
     parser.add_argument("-n", "--n-lambda", type=int, default=21, help="points along the path")
-    parser.add_argument("--xtb", action="store_true", help="re-score the path with xtb")
+    parser.add_argument("--xtb", action="store_true", help="score every candidate path with xtb before selection")
     parser.add_argument("--method", choices=sorted(METHODS), help="explicit physical method for --xtb")
     parser.add_argument("--engine", choices=("gfnff", "mmff", "auto"), help="explicit FF construction engine")
     parser.add_argument("--multiplicity", type=int, help="declared spin multiplicity")
@@ -50,14 +50,14 @@ def main() -> None:
         n_cores=args.n_cores,
     )
 
-    path = tsg.find_transition_state(args.reaction)
+    paths = tsg.paths(args.reaction)
 
-    on = "qm" if args.xtb else "ff"
     if args.xtb:
         print(f"Physical method: {args.method}")
-        path.score(method=args.method, solvent=args.solvent)
+        paths = paths.score(method=args.method, solvent=args.solvent)
 
-    guess = path.guess(on)
+    path = paths.best()
+    guess = path.guess()
 
     print()
     print(guess.dump(f"{args.prefix}.xyz"))  # the one structure, its origin in the XYZ comment

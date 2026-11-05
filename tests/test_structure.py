@@ -41,11 +41,11 @@ def test_ff_guess_keeps_surface_metadata():
     path = tsg.find_transition_state(["C[Br]", "[Cl-]"], ["C[Cl]", "[Br-]"])
     path.metal_angle_k = 239.0
     path.metal_angle_reference = "endpoint_graph"
-    guess = path.guess("ff")
+    guess = path.guess()
     assert guess.method == path.engine == "mmff"
     assert path.qm_method is None
 
-    exported = [guess.to_atoms(), path.to_atoms()[path.peak_index("ff")]]
+    exported = [guess.to_atoms(), path.to_atoms()[path.peak_index()]]
     for atoms in exported:
         context = atoms.info["rxts"]
         assert context["metal_angle_k"] == path.metal_angle_k
@@ -93,10 +93,10 @@ def test_path_endpoints_and_charge(sn2):
 
 
 def test_guess_is_interior_path_maximum(sn2):
-    i = sn2.peak_index("ff")
+    i = sn2.peak_index()
     assert sn2.ff_energies[i] == pytest.approx(max(sn2.ff_energies))
     assert 0 < i < len(sn2.frames) - 1
-    assert sn2.peak_lambda("ff") == sn2.frames[i].lam
+    assert sn2.peak_lambda() == sn2.frames[i].lam
 
 
 def test_reactive_bonds_cross_over(sn2):
@@ -110,18 +110,18 @@ def test_reactive_bonds_cross_over(sn2):
     assert np.all(np.diff(forming) < 1e-6)
 
     # At the guess, neither bond is made or broken -- both are half-formed.
-    i = sn2.peak_index("ff")
+    i = sn2.peak_index()
     assert breaking[0] < breaking[i] < breaking[-1]
     assert forming[-1] < forming[i] < forming[0]
 
 
 def test_energy_is_referenced_to_the_reactants(sn2):
     assert sn2.ff_energies[0] == pytest.approx(0.0)
-    assert sn2.barrier("ff") > 0.0
+    assert sn2.barrier() > 0.0
 
 
 def test_guess_and_path_dump_separately(sn2, tmp_path):
-    ts = sn2.guess("ff").dump(tmp_path / "ts.xyz")
+    ts = sn2.guess().dump(tmp_path / "ts.xyz")
     trajectory = sn2.dump(tmp_path / "path.xyz")
     n_atoms = sn2.reactant.GetNumAtoms()
 
@@ -138,32 +138,25 @@ def test_guess_and_path_dump_separately(sn2, tmp_path):
 
 
 def test_ff_and_qm_surfaces_are_separate(sn2):
-    assert not hasattr(sn2, "energies"), "`energies` is the bug; it must not exist in any form"
-    assert not hasattr(sn2, "settled"), "the second flag added to patch the first one"
-
+    np.testing.assert_array_equal(sn2.energies, sn2.ff_energies)
+    assert sn2.method == sn2.engine
     assert len(sn2.ff_energies) == len(sn2.frames)  # always the force field, scored or not
     assert sn2.qm_energies is None  # nobody has scored this path
     assert sn2.scored is False  # derived from qm_energies, not a stored flag
 
 
-def test_qm_queries_require_scoring(sn2):
-    for ask in (lambda: sn2.guess("qm"), lambda: sn2.barrier("qm"), lambda: sn2.reaction_energy("qm")):
-        with pytest.raises(ValueError, match="score"):
-            ask()
-
-
-def test_guess_requires_a_known_surface(sn2):
+@pytest.mark.parametrize("query", ["reaction_energy", "summary"])
+def test_surface_queries_use_the_result_without_an_on_argument(sn2, query):
+    assert getattr(sn2, query)() is not None
     with pytest.raises(TypeError):
-        sn2.guess()
-    with pytest.raises(ValueError, match='"ff" or "qm"'):
-        sn2.guess("force field")
+        getattr(sn2, query)(on="ff")
 
 
 def test_guess_is_a_copy(sn2):
     before = sn2.ff_energies.copy()
     positions = [f.positions.copy() for f in sn2.frames]
 
-    guess = sn2.guess("ff")
+    guess = sn2.guess()
     guess.mol.GetConformer().SetAtomPosition(0, (99.0, 99.0, 99.0))  # scribble on what we got back
 
     assert np.array_equal(sn2.ff_energies, before)
@@ -177,11 +170,12 @@ def test_tblite_scores_without_binary(sn2, monkeypatch, caplog):
     monkeypatch.setattr(xtb, "xtb_available", lambda: False)
 
     with caplog.at_level(logging.INFO, logger="rxts"):
-        path.score(method="gfn2")
+        scored = path.score(method="gfn2")
 
-    assert path.scored is True
-    assert path.qm_method == "gfn2"
-    assert len(path.qm_energies) == len(path.frames)
+    assert not path.scored
+    assert scored.scored is True
+    assert scored.qm_method == "gfn2"
+    assert len(scored.qm_energies) == len(path.frames)
     # The progress narration is on the logger now, not stdout: the library does not own stdout.
     assert "Re-scoring" in caplog.text
 
@@ -191,8 +185,11 @@ def test_missing_xtb_error_names_install_hint(sn2, monkeypatch, caplog):
     monkeypatch.setattr(scan, "xtb_available", lambda: False)
 
     with caplog.at_level(logging.WARNING, logger="rxts"), pytest.warns(RuntimeWarning, match="NOT scored"):
-        path.score(method="gfnff")
+        failed = path.score(method="gfnff")
     assert path.scored is False
+    assert failed.scores.failures
+    with pytest.raises(ValueError, match="scoring failed"):
+        failed.guess()
     assert "XTB_EXE" in caplog.text  # the actionable hint, not just "not found"
 
 
@@ -203,25 +200,26 @@ def test_scoring_selects_qm_guess_without_changing_ff():
     path = tsg.find_transition_state("[I-].CCl>>[Cl-].CI")
 
     ff_before = path.ff_energies.copy()
-    ff_guess_before = path.guess("ff").positions.copy()
+    ff_guess_before = path.guess().positions.copy()
 
-    path.score(method="gxtb", n_cores=1)
+    scored = path.score(method="gxtb", n_cores=1)
 
     assert np.array_equal(path.ff_energies, ff_before)
-    assert np.array_equal(path.guess("ff").positions, ff_guess_before)
+    assert np.array_equal(path.guess().positions, ff_guess_before)
 
-    assert path.scored is True
-    assert path.qm_energies is not None
-    assert len(path.qm_energies) == len(path.frames)
+    assert not path.scored
+    assert scored.scored is True
+    assert scored.qm_energies is not None
+    assert len(scored.qm_energies) == len(path.frames)
 
-    peak = int(np.argmax(path.qm_energies))
-    assert path.peak_index("qm") == peak
-    np.testing.assert_array_equal(path.guess("qm").positions, path.frames[peak].positions)
+    peak = int(np.argmax(scored.qm_energies))
+    assert scored.peak_index() == peak
+    np.testing.assert_array_equal(scored.guess().positions, path.frames[peak].positions)
 
     # Each geometry names the surface that picked it, and says so in the file it writes.
-    assert path.guess("ff").method == path.engine
-    assert path.guess("qm").method == path.qm_method
-    assert path.guess("ff").method != path.guess("qm").method
+    assert path.guess().method == path.engine
+    assert scored.guess().method == scored.qm_method
+    assert path.guess().method != scored.guess().method
 
 
 @pytest.mark.parametrize(("stiffness", "combined"), [(1.0, True), (3.0, False)])
@@ -254,16 +252,18 @@ def test_external_frame_scoring(sn2, monkeypatch, stiffness, combined):
     path = copy.deepcopy(sn2)
     original = [frame.positions.copy() for frame in path.frames]
     method = CalculatorMethod(f"quadratic k={stiffness}", factory)
-    attempt = path.score(method, solvent="water", n_cores=2)
+    scored = path.score(method, solvent="water", n_cores=2)
+    attempt = scored.scores
     expected = [stiffness * np.sum(x * x) / (2 * xtb.EV_PER_KCAL) for x in original]
     assert attempt.failures == {}
     assert attempt.method == method.label
     assert (attempt.charge, attempt.multiplicity, attempt.solvent) == (path.charge, path.multiplicity, "water")
     np.testing.assert_allclose(attempt.energies_ev, np.array(expected) * xtb.EV_PER_KCAL)
-    np.testing.assert_allclose([frame.qm_energy for frame in path.frames], expected)
+    np.testing.assert_allclose(scored.qm_energies, np.array(expected) - expected[0])
+    assert path.qm_energies is None
     for before, frame in zip(original, path.frames, strict=True):
         np.testing.assert_array_equal(frame.positions, before)
-    exported = path.to_atoms()
+    exported = scored.to_atoms()
     assert len(exported) == len(path.frames)
     assert all(image.calc is None for image in exported)
     for image, positions in zip(exported, original, strict=True):
@@ -271,7 +271,7 @@ def test_external_frame_scoring(sn2, monkeypatch, stiffness, combined):
         assert image.info["rxts"]["mapping"] == path.mapping
         assert image.info["rxts"]["qm_method"] == method.label
         assert image.info["rxts"]["qm_solvent"] == "water"
-    guess = path.guess("qm")
+    guess = scored.guess()
     assert guess.method is method
     assert guess.label == method.label
     assert guess.solvent == "water"
@@ -298,10 +298,11 @@ def test_instance_scores_serially_and_keeps_frames(sn2):
     path.n_cores = 6
     method = Surface()
     coordinates = [frame.positions.copy() for frame in path.frames]
-    path.score(method=method)
-    assert isinstance(path.qm_method, rxts.CalculatorMethod)
-    assert path.qm_method.label == method.name
-    assert path.scored
+    scored = path.score(method=method)
+    assert isinstance(scored.qm_method, rxts.CalculatorMethod)
+    assert scored.qm_method.label == method.name
+    assert scored.scored
+    assert not path.scored
     assert [context["frame_index"] for context in seen] == list(range(len(path.frames)))
     for context in seen:
         assert context["charge"] == path.charge
@@ -333,14 +334,19 @@ def test_failed_rescore_keeps_prior_profile(sn2):
 
     path = copy.deepcopy(sn2)
     previous = rxts.CalculatorMethod("first physical surface", calculator=Surface())
-    path.score(previous)
-    energies = path.qm_energies.copy()
+    scored = path.score(previous)
+    energies = scored.qm_energies.copy()
     failed = rxts.CalculatorMethod("failed physical surface", calculator=Surface(fail=True))
-    with pytest.warns(RuntimeWarning, match="earlier scores are retained"):
-        attempt = path.score(failed)
+    with pytest.warns(RuntimeWarning, match="frames failed"):
+        unsuccessful = scored.score(failed)
+    attempt = unsuccessful.scores
     assert attempt.method == failed.label
     assert attempt.energies_ev == (None,) * len(path.frames)
     assert set(attempt.failures) == set(range(len(path.frames)))
     assert all("lost its state" in reason for reason in attempt.failures.values())
-    assert path.qm_method is previous
-    np.testing.assert_array_equal(path.qm_energies, energies)
+    assert scored.qm_method is previous
+    np.testing.assert_array_equal(scored.qm_energies, energies)
+    assert path.scores is None
+    for query in (unsuccessful.guess, unsuccessful.barrier, unsuccessful.peak_index):
+        with pytest.raises(ValueError, match="scoring failed"):
+            query()

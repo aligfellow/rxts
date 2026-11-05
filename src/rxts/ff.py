@@ -15,8 +15,6 @@ import rxembed
 from ase import Atoms
 from ase.calculators.calculator import Calculator, all_changes
 from ase.optimize import LBFGS
-from rdkit import Chem
-from rdkit.Chem import rdMolTransforms
 
 from rxts import scoring
 from rxts.builder import PreparedReaction
@@ -36,7 +34,7 @@ from rxts.evb import (
 from rxts.gfnff import in_process_available
 from rxts.mapping import bond_set
 from rxts.scoring import CalculatorMethod
-from rxts.structure import ReactionPath, _frame, method_label
+from rxts.structure import ReactionPath, ReactionPaths, _frame, method_label
 from rxts.utils import (
     _worker_count,
     align_frames,
@@ -54,6 +52,8 @@ from rxts.xtb import EV_PER_KCAL, METHODS
 if TYPE_CHECKING:  # annotations only
     from collections.abc import Sequence
     from pathlib import Path
+
+    from rdkit import Chem
 
 logger = logging.getLogger(__name__)
 
@@ -158,13 +158,8 @@ class TransitionStateGuesser:
     constraint_k: float = 100.0  # kcal/mol/A^2
     metal_angle_k: float = _METAL_ANGLE_K  # kcal/mol/rad^2; 1000 kJ/mol/rad^2 from VeloxChem
 
-    # Optional spectator torsion proposals at lambda=0; the scan carries the selected conformer.
+    # Requested co-embedded endpoint pairs; each accepted reactant seeds a complete scan on the same fields.
     n_conformers: int = 4
-
-    # rxts uses its own Langevin sampler at every lambda; it does not reproduce VeloxChem's integrator.
-    md_steps: int = 0
-    md_temperature: float = 600.0  # K
-    md_timestep: float = 0.5  # fs
 
     # VeloxChem's peak-band search with rxembed proposals in place of MD.
     n_embed: int = 4
@@ -218,15 +213,12 @@ class TransitionStateGuesser:
             value = getattr(self, name)
             check(name, value is None or (isinstance(value, str) and bool(value.strip())), "None or a geometry name")
         check("engine", self.engine is None or self.engine in _ENGINES, f"None or one of {_ENGINES}")
-        for name in ("morse_d", "md_temperature", "md_timestep"):
-            value = getattr(self, name)
-            check(name, _finite(value) and value > 0, "a finite positive number")
+        check("morse_d", _finite(self.morse_d) and self.morse_d > 0, "a finite positive number")
         check("soft_core", _finite(self.soft_core) and self.soft_core >= 0, "a finite non-negative number")
         check("constraints", _targets(self.constraints), "atom-pair distances with distinct atoms and positive values")
         check("constraint_k", _finite(self.constraint_k) and self.constraint_k >= 0, "a finite non-negative number")
         check("metal_angle_k", _finite(self.metal_angle_k) and self.metal_angle_k >= 0, "a finite non-negative number")
         check("n_conformers", _an_int(self.n_conformers, 1), "an int >= 1")
-        check("md_steps", _an_int(self.md_steps, 0), "an int >= 0")
         check("n_embed", _an_int(self.n_embed, 0), "an int >= 0")
         check("embed_window", _an_int(self.embed_window, 0), "an int >= 0")
         check("peak_anchored", isinstance(self.peak_anchored, bool), "True or False")
@@ -250,13 +242,14 @@ class TransitionStateGuesser:
 
     def prepare_endpoints(
         self,
-        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol],
+        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | rxembed.Coembedded,
         product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | None = None,
     ) -> PreparedReaction:
         return _prepare_endpoints(
             reactant,
             product,
             seed=self.seed,
+            n_conformers=self.n_conformers,
             forming_bonds=self.forming_bonds,
             breaking_bonds=self.breaking_bonds,
             mapping=self.mapping,
@@ -270,14 +263,24 @@ class TransitionStateGuesser:
 
     def find_transition_state(
         self,
-        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | PreparedReaction,
+        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | PreparedReaction | rxembed.Coembedded,
         product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | None = None,
     ) -> ReactionPath:
-        """Build an FF path; optionally score peak candidates on a physical calculator."""
+        """Build all candidate paths and return the one with the lowest absolute FF maximum."""
+        path = self.paths(reactant, product).best()
+        logger.info(path.summary())
+        return path
+
+    def paths(
+        self,
+        reactant: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | PreparedReaction | rxembed.Coembedded,
+        product: str | Path | Chem.Mol | Sequence[str | Chem.Mol] | None = None,
+    ) -> ReactionPaths:
+        """Build every candidate path on shared frozen fields, retaining each endpoint pair and sampling evidence."""
         if self.embed_score is not None and (self.n_embed < 1 or not self.peak_anchored):
             raise ValueError(
                 "embed_score requires n_embed > 0 and peak_anchored=True; "
-                "it ranks the anchored peak search, not every MD proposal or the finished path"
+                "it ranks anchored peak proposals; use paths(...).score(...) to score complete candidate paths"
             )
         if self.engine is None:
             raise ValueError("FF interpolation requires an explicit engine=; pass 'auto', 'mmff' or 'gfnff'")
@@ -290,6 +293,10 @@ class TransitionStateGuesser:
         else:
             prepared = self.prepare_endpoints(reactant, product)
         n_atoms = prepared.reactant.GetNumAtoms()
+        if prepared.reactant.GetNumConformers() != prepared.product.GetNumConformers():
+            raise ValueError("Prepared endpoints must contain the same number of paired conformers")
+        if not prepared.reactant.GetNumConformers():
+            raise ValueError("Prepared endpoints must contain at least one conformer pair")
         if any(i >= n_atoms for pair in self.constraints for i in pair):
             raise ValueError(f"constraints must use atom indices in [0, {n_atoms})")
         if self.embed_score is not None and not (prepared.forming_bonds or prepared.breaking_bonds):
@@ -309,40 +316,56 @@ class TransitionStateGuesser:
         runner._product_mapping = prepared.mapping
         runner._sampling_failures = []
         runner._conformer_selections = []
-        rea, pro = Chem.Mol(prepared.reactant), Chem.Mol(prepared.product)
+        rea, pro = (
+            with_conformer(mol, mol.GetConformer().GetPositions()) for mol in (prepared.reactant, prepared.product)
+        )
         forming, breaking = set(prepared.forming_bonds), set(prepared.breaking_bonds)
         engine = runner._choose_engine(rea, pro)
         pot = runner._build_potential(
             engine=engine, rea=rea, pro=pro, forming=forming, breaking=breaking, charge=prepared.charge
         )
+        paths = []
         try:
-            frames = runner._scan(pot, rea, prepared.charge)
+            for index, (rconf, pconf) in enumerate(
+                zip(prepared.reactant.GetConformers(), prepared.product.GetConformers(), strict=True)
+            ):
+                logger.info("Scanning co-embedded endpoint pair %d/%d", index + 1, prepared.reactant.GetNumConformers())
+                runner._sampling_failures = []
+                runner._conformer_selections = []
+                start, end = with_conformer(rea, rconf.GetPositions()), with_conformer(pro, pconf.GetPositions())
+                frames = runner._scan(pot, start, prepared.charge)
+                paths.append(
+                    ReactionPath(
+                        frames=frames,
+                        reactant=start,
+                        product=end,
+                        forming_bonds=list(prepared.forming_bonds),
+                        breaking_bonds=list(prepared.breaking_bonds),
+                        mapping=list(prepared.mapping),
+                        engine=engine,
+                        charge=prepared.charge,
+                        multiplicity=prepared.multiplicity,
+                        n_cores=prepared.n_cores,
+                        solvent=prepared.solvent,
+                        mol=start,
+                        endpoint_identity=prepared.endpoint_identity,
+                        metal_angle_k=pot.metal_angle_k,
+                        metal_angle_reference=pot.metal_angle_source,
+                        sampling_failures=list(runner._sampling_failures),
+                        conformer_selections=list(runner._conformer_selections),
+                    )
+                )
         except BaseException as error:
-            # Retain paid evidence when a later step fails or the caller interrupts.
-            error.conformer_selections = list(runner._conformer_selections)  # ty: ignore[unresolved-attribute]
-            error.sampling_failures = list(runner._sampling_failures)  # ty: ignore[unresolved-attribute]
+            # Retain complete paid paths and the current attempt if a later scan fails or is interrupted.
+            error.candidate_paths = ReactionPaths(paths)  # ty: ignore[unresolved-attribute]
+            error.conformer_selections = [  # ty: ignore[unresolved-attribute]
+                record for path in paths for record in path.conformer_selections
+            ] + list(runner._conformer_selections)
+            error.sampling_failures = [  # ty: ignore[unresolved-attribute]
+                failure for path in paths for failure in path.sampling_failures
+            ] + list(runner._sampling_failures)
             raise
-        path = ReactionPath(
-            frames=frames,
-            reactant=rea,
-            product=pro,
-            forming_bonds=list(prepared.forming_bonds),
-            breaking_bonds=list(prepared.breaking_bonds),
-            mapping=list(prepared.mapping),
-            engine=engine,
-            charge=prepared.charge,
-            multiplicity=prepared.multiplicity,
-            n_cores=prepared.n_cores,
-            solvent=prepared.solvent,
-            mol=rea,
-            endpoint_identity=prepared.endpoint_identity,
-            metal_angle_k=pot.metal_angle_k,
-            metal_angle_reference=pot.metal_angle_source,
-            sampling_failures=list(runner._sampling_failures),
-            conformer_selections=list(runner._conformer_selections),
-        )
-        logger.info(path.summary("ff"))
-        return path
+        return ReactionPaths(paths)
 
     def _choose_engine(self, rea, pro):
         """Choose MMFF when both endpoints type, otherwise GFN-FF when `engine='auto'`."""
@@ -424,9 +447,6 @@ class TransitionStateGuesser:
     def _scan(self, pot, rea, charge):
         lambdas = np.linspace(0.0, 1.0, self.n_lambda)
         x = rea.GetConformer().GetPositions()
-        rng = np.random.default_rng(self.seed)
-
-        x = self._best_conformer(pot=pot, rea=rea, x=x, rng=rng)
 
         logger.info(f"{'lambda':>7s} {'E_reactant':>12s} {'E_product':>12s} {'V':>10s}")
         logger.info(f"{'':->7s} {'':->12s} {'':->12s} {'':->10s}")
@@ -434,17 +454,8 @@ class TransitionStateGuesser:
         frames = []
         for lam in lambdas:
             x = self._minimize(pot, x, lam)
-            candidates = [x]
-            if self.md_steps:
-                # MD proposals are relaxed on the same lambda sampling surface.
-                for _ in range(self.n_conformers - 1):
-                    shaken = self._sample(pot=pot, x=x, lam=lam, rng=rng)
-                    candidates.append(self._minimize(pot, shaken, lam))
-
             # Minimise on the sampling surface, then score on the unrestrained interpolation.
-            scored = [(pot.energy(c, lam), c) for c in candidates]
-            res, x = min(scored, key=lambda s: s[0][0])
-            frame = _frame(res, x, float(lam))
+            frame = _frame(pot.energy(x, lam), x, float(lam))
             frames.append(frame)
             logger.info(f"{lam:7.3f} {frame.e_reactant:12.2f} {frame.e_product:12.2f} {frame.energy:10.2f}")
 
@@ -582,6 +593,13 @@ class TransitionStateGuesser:
             raise ValueError("Configured conformer calculators require serial scoring; pass n_cores=1")
         ff_energies = tuple(float(pot.energy(candidate, lam)[0]) for candidate in candidates)
         ff_best = min(range(len(candidates)), key=lambda i: ff_energies[i])
+        selection = {
+            "lambda": float(lam),
+            "selected_index": ff_best,
+            "ff_energies_kcal_per_mol": ff_energies,
+            "ff_selected_index": ff_best,
+        }
+        self._conformer_selections.append(selection)
         if not self.embed_score:
             return candidates[ff_best]
 
@@ -600,15 +618,7 @@ class TransitionStateGuesser:
             solvent=self.solvent,
             n_cores=cores,
         )
-        selection = {
-            "lambda": float(lam),
-            "candidates": atoms,
-            "scores": result,
-            "selected_index": None,
-            "ff_energies_kcal_per_mol": ff_energies,
-            "ff_selected_index": ff_best,
-        }
-        self._conformer_selections.append(selection)
+        selection.update(candidates=atoms, scores=result, selected_index=None)
         if result.failures:
             raise ConformerScoringError(result, atoms, selection=selection)
         qm_best = int(np.argmin(np.asarray(result.energies_ev, dtype=float)))
@@ -672,36 +682,6 @@ class TransitionStateGuesser:
                 bad |= {i, i + 1}
         return bad - {0, len(frames) - 1}
 
-    def _best_conformer(self, pot, rea, x, rng):
-        """Resample spectator torsions and keep the reactant structure whose path preview peaks lowest.
-
-        Each candidate is relaxed at lambda=0, then carried through `_PREVIEW` as the scan would; the lowest highest
-        point wins, so the start suits the path rather than the reactant alone.
-        """
-        if self.n_conformers <= 1:
-            return x
-
-        candidates = conformers(mol=rea, x=x, reactive=pot.changing, n=self.n_conformers, rng=rng)
-        if not candidates:
-            return x
-
-        best, best_peak, starting = None, np.inf, None
-        for trial_x in (x, *candidates):
-            start = self._minimize(pot, trial_x, 0.0)
-            y, peak = start, -np.inf
-            for lam in _PREVIEW:
-                y = self._minimize(pot, y, lam)
-                peak = max(peak, pot.energy(y, lam)[0])
-            starting = peak if starting is None else starting
-            if peak < best_peak:
-                best, best_peak = start, peak
-
-        logger.info(
-            f"Conformer search: {len(candidates)} spectator conformer(s); reactive atoms excluded from torsion moves. "
-            f"Path preview peak {starting:.2f} -> {best_peak:.2f} kcal/mol"
-        )
-        return best
-
     def _energy_grad(self, pot, x, lam):
         """Evaluate the sampling surface and user distance restraints."""
         e, g = pot.sampling_energy(x, lam)
@@ -757,26 +737,6 @@ class TransitionStateGuesser:
             raise _FFRelaxationError(lam, positions, energy, forces, reason)
         return positions
 
-    def _sample(self, pot, x, lam, rng):
-        """Brief Langevin dynamics, to move the structure out of a local minimum."""
-        kb = 0.0019872041  # kcal/mol/K
-        dt = self.md_timestep * 0.02045  # fs -> AKMA-ish time units for amu/A/kcal
-        m = pot.masses[:, None]
-        gamma = 0.1
-        x = x.copy()
-        v = rng.normal(size=x.shape) * np.sqrt(kb * self.md_temperature / m)
-
-        f = -self._energy_grad(pot, x, lam)[1]
-        for _ in range(self.md_steps):
-            v += 0.5 * dt * f / m
-            x += dt * v
-            f = -self._energy_grad(pot, x, lam)[1]
-            v += 0.5 * dt * f / m
-            # Langevin thermostat
-            c = np.exp(-gamma)
-            v = c * v + np.sqrt((1 - c**2) * kb * self.md_temperature / m) * rng.normal(size=x.shape)
-        return x
-
 
 def interpolate(prepared: PreparedReaction, *, engine: str, **settings: Any) -> ReactionPath:
     """Interpolate prepared endpoints on an explicitly selected force field."""
@@ -785,7 +745,14 @@ def interpolate(prepared: PreparedReaction, *, engine: str, **settings: Any) -> 
             if settings[name] != getattr(prepared, name):
                 raise ValueError(f"{name} is fixed by prepare_endpoints(); pass the value there")
             del settings[name]
-    unused = {"mapping", "forming_bonds", "breaking_bonds", "reactant_geometry", "product_geometry"} & settings.keys()
+    unused = {
+        "mapping",
+        "forming_bonds",
+        "breaking_bonds",
+        "reactant_geometry",
+        "product_geometry",
+        "n_conformers",
+    } & settings.keys()
     if unused:
         raise TypeError(f"{', '.join(sorted(unused))} are endpoint options; pass them to prepare_endpoints()")
 
@@ -797,67 +764,6 @@ __all__ = ["ConformerScoringError", "interpolate"]
 
 # Hold reactive distances without holding the attack angle. FF relaxation then settles each proposal.
 _ORGANIC_DISTANCE_PAD = 0.05
-
-# Lambdas a starting conformer is carried through to preview its path (see `_best_conformer`).
-_PREVIEW = (0.25, 0.5, 0.75)
-
-
-def rotatable_torsions(mol, reactive=()):
-    """List acyclic spectator torsions, excluding bonds or atoms in the reaction center."""
-    frozen = {int(a) for pair in reactive for a in pair}
-    edges = sorted(perceived_bonds(mol))
-
-    neighbours = {i: [] for i in range(mol.GetNumAtoms())}
-    for i, j in edges:
-        neighbours[i].append(j)
-        neighbours[j].append(i)
-
-    ring_info = mol.GetRingInfo()
-    in_ring = set()
-    for ring in ring_info.AtomRings():
-        for a, b in zip(ring, ring[1:] + ring[:1], strict=True):
-            in_ring.add(tuple(sorted((a, b))))
-
-    torsions = []
-    for j, k in edges:
-        if (j, k) in in_ring:
-            continue  # rotating a ring bond tears the ring
-        if j in frozen or k in frozen:
-            continue  # this bond is the reaction, not a spectator
-        left = [a for a in neighbours[j] if a != k and a not in frozen]
-        right = [a for a in neighbours[k] if a != j and a not in frozen]
-        if not left or not right:
-            continue  # a bond to a terminal atom has no torsion about it
-        torsions.append((left[0], j, k, right[0]))
-    return torsions
-
-
-def resample_torsions(mol, x, torsions, rng):
-    if not torsions:
-        return x.copy()
-
-    work = set_positions(mol, x)
-    conf = work.GetConformer()
-
-    for torsion in torsions:
-        angle = float(rng.uniform(-180.0, 180.0))
-        try:
-            a, b, c, d = torsion
-            rdMolTransforms.SetDihedralDeg(conf, a, b, c, d, angle)
-        except (ValueError, RuntimeError):
-            continue  # a degenerate (collinear) torsion has no angle to set; leave it alone
-
-    return np.asarray(conf.GetPositions())
-
-
-def conformers(mol, x, reactive, n, rng):
-    """Propose uniform spectator-torsion rotations for the FF scan to relax."""
-    if n <= 1:
-        return []
-    torsions = rotatable_torsions(mol, reactive)
-    if not torsions:
-        return []
-    return [resample_torsions(mol=mol, x=x, torsions=torsions, rng=rng) for _ in range(n - 1)]
 
 
 def metal_core(mol, x, targets):
@@ -884,11 +790,11 @@ def embed_candidates(mol, x, targets, n, *, n_cores=None, seed=0xF00D, isomer=No
     fix = fixed or {
         pair: (distance - _ORGANIC_DISTANCE_PAD, distance + _ORGANIC_DISTANCE_PAD) for pair, distance in targets.items()
     }
-    source = with_conformer(mol if isomer is None else isomer, x)
-    if fixed:  # the TS frame seats the metal's donors, so the species embedded is the one the frame realises
-        source = rxembed.isomers(source, observed=True)[0]
     threads = _worker_count(int(n), n_cores)
     try:
+        source = with_conformer(mol if isomer is None else isomer, x)
+        if fixed:  # the TS frame seats the metal's donors, so embed the species the frame realises
+            source = rxembed.isomers(source, observed=True)[0]
         logger.debug(
             "  re-embedding %d targets with %s.", len(targets), "a rigid core" if fixed else "distance windows"
         )

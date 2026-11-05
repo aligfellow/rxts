@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from rdkit import Chem
 
 from rxts import scoring
 from rxts.scoring import CalculatorMethod, ScoreResult
@@ -28,7 +29,6 @@ if TYPE_CHECKING:
 
     from ase import Atoms
     from ase.calculators.calculator import BaseCalculator
-    from rdkit import Chem
 
 _METHOD_NAMES = {"gxtb": "g-xTB", "gfnff": "GFN-FF", "mmff": "MMFF94"}
 
@@ -118,7 +118,6 @@ class Frame:
     energy: float  # interpolated force-field energy V, kcal/mol
     e_reactant: float  # reactant force field at this geometry, kcal/mol
     e_product: float  # product force field at this geometry, kcal/mol
-    qm_energy: float | None = None  # physical energy, kcal/mol, if scored
 
 
 def _frame(res, x, lam):
@@ -129,10 +128,7 @@ def _frame(res, x, lam):
 
 @dataclass
 class ReactionPath:
-    """An ordered FF scan with optional fixed-frame physical scores.
-
-    Select every peak/barrier surface explicitly with "ff" or "qm".
-    """
+    """An ordered FF scan, or an independently scored copy carrying its calculator's profile."""
 
     frames: list[Frame]
     reactant: Chem.Mol
@@ -149,9 +145,9 @@ class ReactionPath:
     # Reactant graph in the frames' atom order.
     mol: Chem.Mol = field(repr=False)
 
-    # Set with qm_energy only after every frame scores successfully.
+    # Scoring context, including failed attempts with partial frame energies.
     qm_method: str | CalculatorMethod | None = field(default=None, repr=False)
-    qm_solvent: str | None = field(default=None, repr=False)
+    scores: ScoreResult | None = field(default=None, repr=False)
     endpoint_identity: tuple[dict | None, dict | None] = field(default=(None, None), repr=False)
     metal_angle_k: float = field(default=0.0, repr=False)
     metal_angle_reference: str | None = field(default=None, repr=False)
@@ -167,10 +163,15 @@ class ReactionPath:
     @property
     def qm_energies(self) -> np.ndarray | None:
         """Physical energies relative to the reactant frame, in kcal/mol; None until fully scored."""
-        if any(f.qm_energy is None for f in self.frames):
+        if self.scores is None or self.scores.failures or any(e is None for e in self.scores.energies_ev):
             return None
-        e = np.array([f.qm_energy for f in self.frames], dtype=float)
+        e = self.absolute_energies
         return e - e[0]
+
+    @property
+    def qm_solvent(self) -> str | None:
+        """The scoring attempt's solvent, or None before scoring."""
+        return None if self.scores is None else self.scores.solvent
 
     @property
     def scored(self) -> bool:
@@ -182,56 +183,67 @@ class ReactionPath:
         """Physical method label, or None before scoring."""
         return None if self.qm_method is None else method_label(self.qm_method)
 
-    def _energies(self, on):
-        """Resolve the explicitly requested energy surface."""
-        if on == "ff":
-            return self.ff_energies
-        if on == "qm":
-            e = self.qm_energies
-            if e is None:
-                raise ValueError(
-                    "This path has no QM energies: score() has not run, or it failed. "
-                    'Run path.score(method=...) or select on="ff" explicitly.'
-                )
-            return e
-        raise ValueError(f'on must be "ff" or "qm", not {on!r}: say which surface you are asking about.')
+    @property
+    def method(self) -> str | CalculatorMethod:
+        """The force field or supplied calculator that defines this result's energies."""
+        if self.scores is None:
+            return self.engine
+        assert self.qm_method is not None
+        return self.qm_method
 
-    def peak_index(self, on: str) -> int:
-        """Highest frame on the named surface, after keeping the lowest FF candidate per window."""
-        return int(np.nanargmax(self._energies(on)))
+    @property
+    def absolute_energies(self) -> np.ndarray:
+        """Absolute energies in kcal/mol; refuse incomplete scores and nonfinite profiles."""
+        if self.scores is None:
+            energies = np.array([frame.energy for frame in self.frames], dtype=float)
+        else:
+            if self.scores.failures or any(e is None for e in self.scores.energies_ev):
+                raise ValueError("Path scoring failed; inspect path.scores.failures before selecting a candidate")
+            energies = np.asarray(self.scores.energies_ev, dtype=float) / EV_PER_KCAL
+        if len(energies) != len(self.frames) or not len(energies) or not np.isfinite(energies).all():
+            raise ValueError("A path needs one finite energy for every frame before selection")
+        return energies
 
-    def peak_lambda(self, on: str) -> float:
-        """Lambda at the highest frame on the named surface."""
-        return float(self.frames[self.peak_index(on)].lam)
+    @property
+    def energies(self) -> np.ndarray:
+        """This result's energies relative to its reactant frame, in kcal/mol."""
+        values = self.absolute_energies
+        return values - values[0]
 
-    def barrier(self, on: str) -> float:
-        """Peak minus reactant-frame energy on the named surface, in kcal/mol."""
-        return float(self._energies(on)[self.peak_index(on)])
+    def peak_index(self) -> int:
+        """Index of the highest sampled frame on this result's energy profile."""
+        return int(np.argmax(self.absolute_energies))
 
-    def reaction_energy(self, on: str) -> float:
-        """Products minus reactants on the named surface, kcal/mol. Negative means exothermic."""
-        return float(self._energies(on)[-1])
+    def peak_lambda(self) -> float:
+        """Lambda at the highest sampled frame on this result's energy profile."""
+        return float(self.frames[self.peak_index()].lam)
 
-    def guess(self, on: str) -> Geometry:
-        """Return the peak candidate on the explicit surface, preserving state and correspondence."""
-        i = self.peak_index(on)
+    def barrier(self) -> float:
+        """Peak minus this path's reactant-frame energy, in kcal/mol."""
+        return float(self.energies[self.peak_index()])
+
+    def reaction_energy(self) -> float:
+        """Products minus reactants on this result's profile, in kcal/mol."""
+        return float(self.energies[-1])
+
+    def guess(self) -> Geometry:
+        """Return the highest sampled geometry, preserving the method, state and correspondence."""
+        i = self.peak_index()
         frame = self.frames[i]
-        method = self.engine if on == "ff" else self.qm_method
-        solvent = self.solvent if on == "ff" else self.qm_solvent
-        label = method_label(method)
+        solvent = self.solvent if self.scores is None else self.qm_solvent
+        label = method_label(self.method)
         what = (
             f"highest point of the {label} scan"
-            if on == "ff"
+            if self.scores is None
             else f"highest {label} point of the force-field scan ({method_label(self.engine)})"
         )
         return self._geometry(
             frame,
-            # Successful physical scoring sets qm_method before a QM peak can be selected.
-            method=method,  # ty: ignore[invalid-argument-type]
+            method=self.method,
             solvent=solvent,
             origin=(
                 f"rxts TS guess, {what} in {solvent or 'gas phase'}, "
-                f"lambda={frame.lam:.2f}, barrier {self.barrier(on):.1f} kcal/mol"
+                f"lambda={frame.lam:.2f}, barrier {self.barrier():.1f} kcal/mol"
             ),
         )
 
@@ -247,8 +259,8 @@ class ReactionPath:
         for i, frame in enumerate(self.frames):
             image = self._geometry(
                 frame,
-                method=self.engine,
-                solvent=self.solvent,
+                method=self.method,
+                solvent=self.solvent if self.scores is None else self.qm_solvent,
                 origin=f"rxts force-field frame {i}, lambda={frame.lam:.3f}",
             ).to_atoms()
             image.info["rxts"].update(
@@ -287,11 +299,11 @@ class ReactionPath:
         method: str | CalculatorMethod | BaseCalculator,
         solvent: str | None = None,
         n_cores: int | None = None,
-    ) -> ScoreResult:
-        """Score existing frames without moving them; return absolute eV energies and indexed failures.
+    ) -> ReactionPath:
+        """Return an independently scored copy; keep partial evaluations in its `scores` on failure.
 
-        Replace the profile only after full success. Built-ins use gas for solvent=None;
-        supplied calculators retain their configured potential.
+        Built-ins use gas for solvent=None; supplied calculators retain their configured potential.
+        Failed results cannot select a guess. The original path and any earlier scored copies stay unchanged.
         """
         method = scoring._normalise_method(method)
         if method is None:
@@ -313,12 +325,7 @@ class ReactionPath:
                 f"scoring. Put xtb on PATH, or set $XTB_EXE to it (a Jupyter kernel often has neither)."
             )
             reason = "xtb was not found on PATH; put xtb on PATH or set $XTB_EXE"
-            warnings.warn(
-                f"Path NOT scored: {reason}. Earlier scores are retained if present.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return ScoreResult(
+            attempt = ScoreResult(
                 (None,) * len(self.frames),
                 dict.fromkeys(range(len(self.frames)), reason),
                 0,
@@ -328,42 +335,45 @@ class ReactionPath:
                 self.multiplicity,
                 solvent,
             )
-
-        if isinstance(method, CalculatorMethod) and method.calculator is not None:
-            cores = 1 if n_cores is None else n_cores
-            execution = "serially"
         else:
-            cores = self.n_cores if n_cores is None else n_cores
-            cores = default_cores() if cores is None else cores
-            execution = f"on {cores} core(s)"
-        logger.info(f"Re-scoring {len(self.frames)} frames with {method_label(method)} {execution}...")
-
-        attempt = scoring.score(
-            self.to_atoms(),
-            charge=self.charge,
-            multiplicity=self.multiplicity,
-            method=method,
-            solvent=solvent,
-            n_cores=cores,
-        )
+            if isinstance(method, CalculatorMethod) and method.calculator is not None:
+                cores = 1 if n_cores is None else n_cores
+                execution = "serially"
+            else:
+                cores = self.n_cores if n_cores is None else n_cores
+                cores = default_cores() if cores is None else cores
+                execution = f"on {cores} core(s)"
+            logger.info(f"Re-scoring {len(self.frames)} frames with {method_label(method)} {execution}...")
+            attempt = scoring.score(
+                self.to_atoms(),
+                charge=self.charge,
+                multiplicity=self.multiplicity,
+                method=method,
+                solvent=solvent,
+                n_cores=cores,
+            )
         if attempt.failures:
-            logger.warning("Frame scoring failed; the previous profile is retained if present.")
             warnings.warn(
-                f"{len(attempt.failures)} of {len(self.frames)} frames failed. "
-                "No scores were replaced; earlier scores are retained if present. "
-                "Inspect the returned failure reasons before using the stored profile.",
+                f"Path NOT scored: {len(attempt.failures)} of {len(self.frames)} frames failed. "
+                "Inspect the returned path.scores.failures; this result cannot select a candidate.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return attempt
-
-        # Commit a complete profile with its method and solvent.
-        for frame, energy in zip(self.frames, attempt.energies_ev, strict=True):
-            assert energy is not None
-            frame.qm_energy = energy / EV_PER_KCAL
-        self.qm_method = method
-        self.qm_solvent = attempt.solvent
-        return attempt
+        return replace(
+            self,
+            frames=[replace(frame, positions=frame.positions.copy()) for frame in self.frames],
+            reactant=Chem.Mol(self.reactant),
+            product=Chem.Mol(self.product),
+            mol=Chem.Mol(self.mol),
+            forming_bonds=list(self.forming_bonds),
+            breaking_bonds=list(self.breaking_bonds),
+            mapping=list(self.mapping),
+            endpoint_identity=deepcopy(self.endpoint_identity),
+            sampling_failures=deepcopy(self.sampling_failures),
+            conformer_selections=deepcopy(self.conformer_selections),
+            scores=attempt,
+            qm_method=method,
+        )
 
     def bond_lengths(self) -> dict[tuple[str, tuple[int, int]], list[float]]:
         """Reactive bond lengths over the ordered path, in angstrom."""
@@ -373,14 +383,14 @@ class ReactionPath:
             for pair in pairs
         }
 
-    def summary(self, on: str = "ff") -> str:
-        """Summarise the candidate and reactive distances on the named surface."""
-        guess = self.guess(on)
+    def summary(self) -> str:
+        """Summarise the candidate and reactive distances on this result's energy profile."""
+        guess = self.guess()
         label = guess.label
         lines = [
-            f"Transition state guess    lambda = {self.peak_lambda(on):.2f}",
-            f"Barrier ({label:^12s})  {self.barrier(on):8.1f} kcal/mol",
-            f"Reaction energy           {self.reaction_energy(on):8.1f} kcal/mol",
+            f"Transition state guess    lambda = {self.peak_lambda():.2f}",
+            f"Barrier ({label:^12s})  {self.barrier():8.1f} kcal/mol",
+            f"Reaction energy           {self.reaction_energy():8.1f} kcal/mol",
             f"Path frames               {len(self.frames)}",
             "",
             "Reactive bonds at the transition state:",
@@ -389,3 +399,62 @@ class ReactionPath:
             for pair in pairs:
                 lines.append(f"  {kind:>8s}  {describe(self.mol, pair):<10s}  {bond_length(guess.mol, pair):5.2f} A")
         return "\n".join(lines)
+
+
+class ReactionPaths(tuple):
+    """An iterable, indexable collection of complete candidate paths, including a one-path result.
+
+    `score` returns independent scored paths. `best` compares absolute profile maxima on a common
+    method and context; it does not compare barriers independently zeroed at different reactants,
+    or certify continuity or a saddle point. Failed scores prevent selection across the collection.
+    """
+
+    def __new__(cls, paths=()):
+        items = tuple(paths)
+        if any(not isinstance(path, ReactionPath) for path in items):
+            raise TypeError("ReactionPaths accepts ReactionPath objects")
+        return super().__new__(cls, items)
+
+    def __getitem__(self, index):
+        picked = super().__getitem__(index)
+        return ReactionPaths(picked) if isinstance(index, slice) else picked
+
+    def score(
+        self,
+        method: str | CalculatorMethod | BaseCalculator,
+        solvent: str | None = None,
+        n_cores: int | None = None,
+    ) -> ReactionPaths:
+        """Score every frame of every path, returning independent paths with their paid results."""
+        method = scoring._normalise_method(method)
+        paths = []
+        try:
+            for path in self:
+                paths.append(path.score(method, solvent=solvent, n_cores=n_cores))
+        except BaseException as error:
+            error.candidate_paths = ReactionPaths(paths)  # ty: ignore[unresolved-attribute]
+            raise
+        return ReactionPaths(paths)
+
+    def best(self) -> ReactionPath:
+        """Return the path with the lowest absolute maximum; refuse mixed methods or incomplete scores."""
+        if not self:
+            raise ValueError("No candidate paths to select; supply at least one endpoint pair")
+        contexts, peaks = [], []
+        for path in self:
+            method = path.method
+            if isinstance(method, CalculatorMethod) and method.calculator is not None:
+                method = method.calculator
+            contexts.append(
+                (
+                    method,
+                    path.solvent if path.scores is None else path.qm_solvent,
+                    path.charge,
+                    path.multiplicity,
+                    tuple(sorted((atom.GetAtomicNum(), atom.GetIsotope()) for atom in path.mol.GetAtoms())),
+                )
+            )
+            peaks.append(float(np.max(path.absolute_energies)))
+        if any(context != contexts[0] for context in contexts[1:]):
+            raise ValueError("Compare paths with the same calculator, solvent, charge, multiplicity and atoms")
+        return self[int(np.argmin(peaks))]

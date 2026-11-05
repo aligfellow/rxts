@@ -300,9 +300,11 @@ def test_owned_xtb_solvent(registry):
 
     guesser = TransitionStateGuesser(engine="mmff", multiplicity=1, n_lambda=3, n_conformers=1, n_embed=0, n_cores=1)
     path = guesser.find_transition_state("CBr.[Cl-]>>CCl.[Br-]")
-    assert not path.score(calculator).failures
-    assert path.qm_solvent == "water"
-    assert path.guess("qm").solvent == "water"
+    scored = path.score(calculator)
+    assert not scored.scores.failures
+    assert scored.qm_solvent == "water"
+    assert scored.guess().solvent == "water"
+    assert path.scores is None
 
 
 def test_only_solvated_gxtb_is_composite(registry, monkeypatch):

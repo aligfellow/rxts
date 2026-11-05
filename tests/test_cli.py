@@ -49,24 +49,29 @@ def _drive(monkeypatch, *argv):
             return name
 
     class _Path:
-        def guess(self, on):
-            seen["on"] = on
+        def guess(self):
             return _Guess()
-
-        def score(self, method=None, solvent=None):
-            seen["scored"] = method
 
         def dump(self, name):
             seen["written"].append(name)
             return name
 
+    class _Paths:
+        def score(self, method=None, solvent=None):
+            seen["scored"] = method
+            return self
+
+        def best(self):
+            seen["selected_after_scoring"] = "scored" in seen
+            return _Path()
+
     class _Guesser:
         def __init__(self, **settings):
             seen["settings"] = settings
 
-        def find_transition_state(self, reactant):
+        def paths(self, reactant):
             seen["reaction"] = reactant
-            return _Path()
+            return _Paths()
 
     monkeypatch.setattr(cli, "TransitionStateGuesser", _Guesser)
     monkeypatch.setattr(cli, "set_verbose", lambda: None)
@@ -80,12 +85,12 @@ def test_cli_writes_selected_surface(monkeypatch):
     assert plain["reaction"] == "C[Br].[Cl-]>>C[Cl].[Br-]"
     assert plain["settings"]["n_lambda"] == 7, "-n reaches the guesser as its own setting, not as a default"
     assert plain["written"] == ["run.xyz", "run_path.xyz"], "one structure and the whole trajectory, both named"
-    assert plain["on"] == "ff"
+    assert plain["selected_after_scoring"] is False
     assert "scored" not in plain, "no --xtb is no QM: the run must not pay for a surface nobody asked for"
 
     scored = _drive(monkeypatch, "C[Br].[Cl-]>>C[Cl].[Br-]", "--xtb", "--method", "gfn1")
     assert scored["scored"] == "gfn1", "--method names the surface --xtb prices on"
-    assert scored["on"] == "qm", "after scoring, the structure written is the QM maximum"
+    assert scored["selected_after_scoring"] is True
 
 
 def test_plot_requires_viz_extra(monkeypatch):
@@ -98,4 +103,4 @@ def test_cli_preserves_reaction_smiles(monkeypatch):
     reaction = "N->[Pd+2].Cl |atomProp:1.geometry.SPL|>O>N->[Pd+2].Cl |atomProp:1.geometry.SPL|"
     seen = _drive(monkeypatch, reaction)
     assert seen["reaction"] == reaction
-    assert seen["on"] == "ff"
+    assert seen["selected_after_scoring"] is False

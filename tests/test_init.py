@@ -15,7 +15,7 @@ def test_core_import_needs_no_workflow_tools():
         " xtb.xtb_exe = lambda: None;"
         " tsg = rxts.TransitionStateGuesser(engine='mmff', multiplicity=1, n_lambda=3, n_cores=1);"
         " path = tsg.find_transition_state('CBr.[Cl-]>>CCl.[Br-]');"
-        " assert len(path.frames)==3; assert path.guess('ff').positions.shape[1]==3;"
+        " assert len(path.frames)==3; assert path.guess().positions.shape[1]==3;"
         " assert rxts.mechanisms('CBr.[Cl-]>>CCl.[Br-]');"
         " assert 'geometric' not in {n for n,v in sys.modules.items() if v is not None};"
         " print('core passed')"
@@ -83,6 +83,7 @@ def test_public_names_are_exported():
         "Geometry",
         "Mechanism",
         "ReactionPath",
+        "ReactionPaths",
         "TransitionStateGuesser",
         "bond_data",
         "draw_mechanisms",
