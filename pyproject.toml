@@ -19,7 +19,7 @@ dependencies = [
     "tblite>=0.7.0",
     "pillow",
     "threadpoolctl>=3.0",
-    "rxembed>=0.2.0",
+    "rxembed @ git+https://github.com/aligfellow/rxembed",
     "xyzgraph>=1.6.19",
 ]
 classifiers = [
@@ -36,10 +36,6 @@ rxts = "rxts.cli:main"
 
 [project.urls]
 homepage = "https://github.com/aligfellow/rxts"
-
-[tool.uv.sources]
-# shortcut: use the local rxembed refactor until its species/coembed API is published.
-rxembed = { path = "../refactor/rxembed", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["src"]
