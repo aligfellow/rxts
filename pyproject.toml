@@ -28,7 +28,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-ff = ["gfnff @ git+https://github.com/pprcht/gfnff/commit/9b6f416ea9e89b5aa874765380b02905020859ed"]
+ff = ["gfnff @ git+https://github.com/pprcht/gfnff"]
 viz = ["plotprofile>=2.0.0", "xyzrender>=0.3"]
 
 [project.scripts]
